@@ -1,86 +1,72 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 REPO="https://github.com/haxpenguin2/auditerm"
-CLONE_DIR="/tmp/auditerm_install"
+INSTALL_TMP="/tmp/auditerm_install"
 VENV_DIR="$HOME/.local/share/auditerm/venv"
 BIN_DIR="$HOME/.local/bin"
+SHARE_DIR="$HOME/.local/share/auditerm"
 
-RED='\033[0;31m'
-GRN='\033[0;32m'
-CYN='\033[0;36m'
-YLW='\033[0;33m'
-RST='\033[0m'
-
-info()  { echo -e "${CYN}◆ ${RST}$*"; }
-ok()    { echo -e "${GRN}✔ ${RST}$*"; }
-warn()  { echo -e "${YLW}⚠ ${RST}$*"; }
-
-cleanup_old() {
-    info "Removing previous auditerm install..."
-    rm -rf "$CLONE_DIR" || true
-    rm -rf "$VENV_DIR" || true
-    rm -f "$HOME/.local/bin/auditerm" || true
-    ok "Previous auditerm install removed"
-}
-
-echo ""
 echo "╔══════════════════════════════════════╗"
 echo "║       auditerm  installer            ║"
 echo "╚══════════════════════════════════════╝"
-echo ""
 
-# deps
-info "Checking system dependencies..."
-command -v python3 >/dev/null || { echo "python3 missing"; exit 1; }
-command -v git >/dev/null || { echo "git missing"; exit 1; }
+echo "◆ Checking system dependencies..."
 
-cleanup_old
+command -v python3 >/dev/null || { echo "Python3 not found"; exit 1; }
+echo "✔ Python found"
 
-# clone
-info "Cloning auditerm..."
-rm -rf "$CLONE_DIR"
-git clone --depth=1 "$REPO" "$CLONE_DIR"
-ok "Repository cloned"
+echo "◆ Removing previous auditerm install..."
 
-# venv
-info "Creating virtual environment..."
+# kill old venv + install artifacts
+rm -rf "$INSTALL_TMP" || true
+rm -rf "$SHARE_DIR" || true
+rm -rf "$HOME/.cache/pip" || true
+rm -f "$BIN_DIR/auditerm" || true
+
+# also purge any pip installs inside venv if it exists
+python3 -m pip uninstall auditerm -y >/dev/null 2>&1 || true
+
+echo "✔ Previous auditerm install removed"
+
+echo "◆ Cloning auditerm..."
+git clone "$REPO" "$INSTALL_TMP"
+echo "✔ Repository cloned"
+
+cd "$INSTALL_TMP"
+
+echo "◆ Creating virtual environment..."
 python3 -m venv "$VENV_DIR"
-ok "Virtual environment ready"
+source "$VENV_DIR/bin/activate"
+echo "✔ Virtual environment ready"
 
-# pip bootstrap (THIS WAS YOUR BUG)
-info "Bootstrapping build tools..."
-"$VENV_DIR/bin/python" -m pip install -U pip setuptools wheel build
+echo "◆ Bootstrapping build tools..."
+python -m pip install -U pip setuptools wheel build --no-cache-dir
 
-# runtime deps
-info "Installing runtime dependencies..."
-"$VENV_DIR/bin/pip" install mutagen numpy pygame-ce
+echo "◆ Installing runtime dependencies..."
+python -m pip install mutagen numpy pygame-ce --no-cache-dir
 
-# install project (verbose now so failures are visible)
-info "Installing auditerm..."
-cd "$CLONE_DIR"
-"$VENV_DIR/bin/pip" install . --no-build-isolation --verbose
+echo "◆ Installing auditerm (EDITABLE MODE)..."
 
-ok "auditerm installed"
+# THIS is the important fix
+# prevents stale wheel/site-packages conflicts
+python -m pip install -e . --no-cache-dir
 
-# launcher
-info "Creating launcher..."
+echo "✔ auditerm installed"
+
+echo "◆ Creating launcher..."
 mkdir -p "$BIN_DIR"
 
-cat > "$BIN_DIR/auditerm" <<EOF
+cat > "$BIN_DIR/auditerm" << EOF
 #!/usr/bin/env bash
-exec "$VENV_DIR/bin/auditerm" "\$@"
+source "$VENV_DIR/bin/activate"
+python -m auditerm.main
 EOF
 
 chmod +x "$BIN_DIR/auditerm"
-ok "Launcher created"
 
-# PATH
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    warn "$BIN_DIR not in PATH (add export PATH=\"\$HOME/.local/bin:\$PATH\")"
-fi
+echo "✔ Launcher created at $BIN_DIR/auditerm"
 
+echo "✔ Done!"
 echo ""
-echo "✔ installation complete"
-echo "run: auditerm"
-echo ""
+echo "Run: auditerm"
