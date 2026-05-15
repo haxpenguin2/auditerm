@@ -2,13 +2,43 @@
 Bottom controls bar: track info, progress, volume, playback state.
 """
 
-import curses
-from auditerm.player import Player, _fmt_time
-from auditerm.ui.colors import cp, PAIR_ACCENT, PAIR_MUTED, PAIR_PLAYING, PAIR_DEFAULT, PAIR_STATUS, PAIR_BAR_FILLED, PAIR_BAR_EMPTY
-from auditerm.config import Config
+from __future__ import annotations
 
-ICONS_UNICODE = {"play": "▶", "pause": "⏸", "stop": "■", "prev": "◀◀", "next": "▶▶", "vol": "♪"}
-ICONS_ASCII   = {"play": ">", "pause": "||", "stop": "[]", "prev": "<<", "next": ">>", "vol": "V"}
+import curses
+
+from auditerm.config import Config
+from auditerm.player import Player
+from auditerm.ui.colors import (
+    PAIR_ACCENT,
+    PAIR_BAR_EMPTY,
+    PAIR_BAR_FILLED,
+    PAIR_DEFAULT,
+    PAIR_MUTED,
+    PAIR_PLAYING,
+    PAIR_STATUS,
+    cp,
+)
+
+ICONS_UNICODE = {
+    "play": "▶",
+    "pause": "⏸",
+    "stop": "■",
+    "prev": "◀◀",
+    "next": "▶▶",
+    "vol": "♪",
+}
+ICONS_ASCII = {
+    "play": ">",
+    "pause": "||",
+    "stop": "[]",
+    "prev": "<<",
+    "next": ">>",
+    "vol": "V",
+}
+
+
+def _safe_hline_char():
+    return getattr(curses, "ACS_HLINE", ord("-"))
 
 
 class ControlsBar:
@@ -22,10 +52,10 @@ class ControlsBar:
         h, w = win.getmaxyx()
         p = self.player
 
-        # ── top divider ──────────────────────────────────────────
+        # top divider
         try:
             win.attron(cp(PAIR_ACCENT))
-            win.hline(0, 0, "─", w)
+            win.hline(0, 0, _safe_hline_char(), w)
             win.attroff(cp(PAIR_ACCENT))
         except curses.error:
             pass
@@ -33,19 +63,21 @@ class ControlsBar:
         if h < 2:
             return
 
-        # ── row 1: track info ────────────────────────────────────
+        # row 1: track info
         track = p.current_track
         if track:
             name = track.display_name()
-            dur  = track.duration_str()
-            ela  = p.elapsed_str()
+            dur = track.duration_str()
+            ela = p.elapsed_str()
             time_str = f" {ela} / {dur} "
-            max_name = w - len(time_str) - 4
-            if len(name) > max_name:
-                name = name[:max_name - 1] + "…"
+            max_name = max(0, w - len(time_str) - 4)
+            if len(name) > max_name and max_name > 1:
+                name = name[: max_name - 1] + "…"
+            elif len(name) > max_name:
+                name = name[:max_name]
             try:
                 win.addstr(1, 2, name, cp(PAIR_PLAYING) | curses.A_BOLD)
-                win.addstr(1, w - len(time_str) - 1, time_str, cp(PAIR_MUTED))
+                win.addstr(1, max(0, w - len(time_str) - 1), time_str, cp(PAIR_MUTED))
             except curses.error:
                 pass
         else:
@@ -57,28 +89,30 @@ class ControlsBar:
         if h < 3:
             return
 
-        # ── row 2: progress bar ──────────────────────────────────
-        prog = p.progress
-        bar_w = w - 4
+        # row 2: progress bar
+        prog = max(0.0, min(1.0, p.progress))
+        bar_w = max(0, w - 4)
         filled = int(prog * bar_w)
         style = self.cfg.get("ui", "progress_style", "bar")
+
         try:
-            if style == "bar":
-                bar = "█" * filled + "░" * (bar_w - filled)
-                win.addstr(2, 2, bar[:bar_w], cp(PAIR_BAR_FILLED))
-            elif style == "dots":
-                bar = "●" * filled + "·" * (bar_w - filled)
-                win.addstr(2, 2, bar[:bar_w], cp(PAIR_ACCENT))
-            else:
-                bar = "=" * filled + "-" * (bar_w - filled)
-                win.addstr(2, 2, bar[:bar_w], cp(PAIR_MUTED))
+            if bar_w > 0:
+                if style == "bar":
+                    bar = "█" * filled + "░" * (bar_w - filled)
+                    win.addstr(2, 2, bar[:bar_w], cp(PAIR_BAR_FILLED))
+                elif style == "dots":
+                    bar = "●" * filled + "·" * (bar_w - filled)
+                    win.addstr(2, 2, bar[:bar_w], cp(PAIR_ACCENT))
+                else:
+                    bar = "=" * filled + "-" * (bar_w - filled)
+                    win.addstr(2, 2, bar[:bar_w], cp(PAIR_MUTED))
         except curses.error:
             pass
 
         if h < 4:
             return
 
-        # ── row 3: state + volume ────────────────────────────────
+        # row 3: state + volume
         if p.is_playing:
             state = f" {self.icons['pause']} PLAYING "
             attr = cp(PAIR_PLAYING) | curses.A_BOLD
@@ -100,8 +134,8 @@ class ControlsBar:
 
         try:
             win.addstr(3, 2, state, attr)
-            win.addstr(3, 12, vol_str, cp(PAIR_ACCENT2))
+            win.addstr(3, 12, vol_str, cp(PAIR_ACCENT))
             if show_help and len(help_str) + 24 < w:
-                win.addstr(3, w - len(help_str) - 1, help_str, cp(PAIR_MUTED))
+                win.addstr(3, max(0, w - len(help_str) - 1), help_str, cp(PAIR_MUTED))
         except curses.error:
             pass
