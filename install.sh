@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO="https://github.com/haxpenguin2/auditerm"
-CLONE_DIR="/tmp/auditerm_install"
+CLONE_DIR="$(mktemp -d /tmp/auditerm_install.XXXXXX)"
 VENV_DIR="$HOME/.local/share/auditerm/venv"
 BIN_DIR="$HOME/.local/bin"
 
@@ -75,7 +75,7 @@ install_system_pygame() {
     case "$(detect_pkg_manager)" in
         pacman)
             command -v sudo >/dev/null 2>&1 || error "sudo is required to install python-pygame from pacman."
-            sudo pacman -Sy --needed --noconfirm python-pygame
+            sudo pacman -S --needed --noconfirm python-pygame
             ;;
         apt)
             command -v sudo >/dev/null 2>&1 || error "sudo is required to install python3-pygame from apt."
@@ -101,12 +101,12 @@ install_system_pygame() {
 }
 
 add_system_python_path_to_venv() {
-    local system_path venv_site
+    local system_site venv_site
 
-    system_path="$(python3 - <<'PY'
-import os
-import pygame
-print(os.path.dirname(os.path.dirname(os.path.abspath(pygame.__file__))))
+    system_site="$(python3 - <<'PY'
+import site
+paths = site.getsitepackages()
+print(paths[0] if paths else site.getusersitepackages())
 PY
 )"
 
@@ -117,7 +117,7 @@ PY
 )"
 
     mkdir -p "$venv_site"
-    printf '%s\n' "$system_path" > "$venv_site/system-pygame.pth"
+    printf '%s\n' "$system_site" > "$venv_site/system-pygame.pth"
 }
 
 echo ""
@@ -140,7 +140,6 @@ ok "Python $PY found"
 
 # ── clone repo ──────────────────────────────────────────────────
 info "Cloning auditerm..."
-rm -rf "$CLONE_DIR"
 run_with_spinner "Cloning repository..." git clone --depth=1 "$REPO" "$CLONE_DIR"
 ok "Repository cloned"
 
@@ -199,7 +198,7 @@ ok "All dependencies verified"
 
 # ── install auditerm ────────────────────────────────────────────
 info "Installing auditerm..."
-run_with_spinner "Installing auditerm..." bash -lc "cd '$CLONE_DIR' && '$VENV_DIR/bin/pip' install . -q"
+run_with_spinner "Installing auditerm..." bash -lc "cd '$CLONE_DIR' && '$VENV_DIR/bin/pip' install --no-deps . -q"
 ok "auditerm installed"
 
 # ── wrapper script ──────────────────────────────────────────────

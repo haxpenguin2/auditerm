@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: auditerm
+Version: 0.1.0
+Summary: A modern terminal audio player with TUI file browser and visualizer
+Author: you
+Requires-Python: >=3.8
+Requires-Dist: pygame
+Requires-Dist: mutagen
+Requires-Dist: numpy
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
