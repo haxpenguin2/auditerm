@@ -47,33 +47,21 @@ echo ""
 # ── check dependencies ──────────────────────────────────────────
 info "Checking system dependencies..."
 
-command -v python3 >/dev/null 2>&1 || error "python3 is required. Install it with: sudo pacman -S python"
-command -v git     >/dev/null 2>&1 || error "git is required. Install it with: sudo pacman -S git"
-command -v curl    >/dev/null 2>&1 || error "curl is required. Install it with: sudo pacman -S curl"
+command -v python3 >/dev/null 2>&1 || error "python3 is required. Install: sudo pacman -S python"
+command -v git     >/dev/null 2>&1 || error "git is required. Install: sudo pacman -S git"
+command -v curl    >/dev/null 2>&1 || error "curl is required. Install: sudo pacman -S curl"
 
 PY=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 ok "Python $PY found"
 
-# check python venv module
-python3 -m venv --help >/dev/null 2>&1 || error "python3-venv is required. Install: sudo pacman -S python"
-
-# ── check for SDL2 (required by pygame) ─────────────────────────
-info "Checking for SDL2 (required by pygame)..."
-if ! ldconfig -p 2>/dev/null | grep -q libSDL2 && ! pacman -Q sdl2 >/dev/null 2>&1; then
-    warn "SDL2 not detected. Attempting to install via pacman..."
-    if command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --noconfirm sdl2 sdl2_mixer || warn "Could not auto-install SDL2. If pygame fails, run: sudo pacman -S sdl2 sdl2_mixer"
-    fi
-else
-    ok "SDL2 found"
-fi
+python3 -m venv --help >/dev/null 2>&1 || error "python venv module missing. Install: sudo pacman -S python"
 
 # ── clone repo ──────────────────────────────────────────────────
-info "Cloning auditerm from GitHub..."
+info "Cloning auditerm..."
 rm -rf "$CLONE_DIR"
 (git clone --depth=1 "$REPO" "$CLONE_DIR" 2>&1) &
 spinner $! "Cloning repository..."
-wait $! || error "Failed to clone repository. Check your internet connection."
+wait $! || error "Failed to clone repository."
 ok "Repository cloned"
 
 # ── create venv ─────────────────────────────────────────────────
@@ -81,73 +69,86 @@ info "Creating virtual environment..."
 mkdir -p "$(dirname "$VENV_DIR")"
 rm -rf "$VENV_DIR"
 python3 -m venv "$VENV_DIR"
-ok "Virtual environment created at $VENV_DIR"
+ok "Virtual environment ready"
 
-# ── upgrade pip ─────────────────────────────────────────────────
-info "Upgrading pip..."
-(
-    "$VENV_DIR/bin/pip" install --upgrade pip 2>&1
-) &
+# ── upgrade pip quietly ─────────────────────────────────────────
+("$VENV_DIR/bin/pip" install --upgrade pip -q 2>&1) &
 spinner $! "Upgrading pip..."
-wait $! || warn "pip upgrade failed (non-fatal, continuing)"
-ok "pip up to date"
+wait $! || true
+ok "pip ready"
 
-# ── install numpy ───────────────────────────────────────────────
-info "Installing numpy..."
-(
-    "$VENV_DIR/bin/pip" install numpy 2>&1
-) &
-spinner $! "Installing numpy (this may take a minute)..."
-wait $! || error "Failed to install numpy."
-ok "numpy installed"
-
-# ── install mutagen ─────────────────────────────────────────────
+# ── install mutagen (pure python, fast) ─────────────────────────
 info "Installing mutagen..."
 (
-    "$VENV_DIR/bin/pip" install mutagen 2>&1
+    "$VENV_DIR/bin/pip" install mutagen -q 2>&1
 ) &
 spinner $! "Installing mutagen..."
 wait $! || error "Failed to install mutagen."
 ok "mutagen installed"
 
-# ── install pygame ──────────────────────────────────────────────
-info "Installing pygame..."
-step "pygame includes compiled binaries — this is the slow one, hang tight"
+# ── install numpy (prebuilt wheel) ──────────────────────────────
+info "Installing numpy..."
 (
-    "$VENV_DIR/bin/pip" install pygame 2>&1
+    "$VENV_DIR/bin/pip" install "numpy" --only-binary=:all: -q 2>&1
 ) &
-spinner $! "Installing pygame (largest package, ~60MB)..."
-wait $! || error "Failed to install pygame. Make sure SDL2 is installed: sudo pacman -S sdl2 sdl2_mixer"
-ok "pygame installed"
+spinner $! "Installing numpy..."
+wait $! || error "Failed to install numpy (no prebuilt wheel for Python $PY). Try: sudo pacman -S python-numpy"
+ok "numpy installed"
+
+# ── install pygame-ce (has wheels for Python 3.13+) ─────────────
+info "Installing pygame-ce (prebuilt wheel, no compilation)..."
+step "pygame-ce is a drop-in replacement for pygame with Python 3.13/3.14 support"
+(
+    "$VENV_DIR/bin/pip" install pygame-ce --only-binary=:all: -q 2>&1
+) &
+spinner $! "Installing pygame-ce..."
+if ! wait $!; then
+    warn "pygame-ce prebuilt wheel not found for Python $PY, falling back to system pygame..."
+    if command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm python-pygame || error "Could not install pygame. Try manually: sudo pacman -S python-pygame"
+        PY_VER=$(python3 -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')")
+        SITE_PKGS="$VENV_DIR/lib/$PY_VER/site-packages"
+        SYS_PYGAME=$(python3 -c "import pygame; import os; print(os.path.dirname(pygame.__file__))" 2>/dev/null || true)
+        if [[ -n "$SYS_PYGAME" ]]; then
+            ln -sfn "$SYS_PYGAME" "$SITE_PKGS/pygame"
+            ok "Linked system pygame into venv"
+        else
+            error "Could not locate system pygame after install."
+        fi
+    else
+        error "No prebuilt pygame wheel for Python $PY and pacman not found."
+    fi
+else
+    ok "pygame-ce installed"
+fi
 
 # ── verify imports ──────────────────────────────────────────────
-info "Verifying installations..."
-
-"$VENV_DIR/bin/python" -c "import pygame" 2>/dev/null   || error "pygame failed to import. Try: sudo pacman -S sdl2 sdl2_mixer"
+info "Verifying dependencies..."
+"$VENV_DIR/bin/python" -c "import pygame" 2>/dev/null   || error "pygame failed to import."
 "$VENV_DIR/bin/python" -c "import mutagen" 2>/dev/null  || error "mutagen failed to import."
 "$VENV_DIR/bin/python" -c "import numpy" 2>/dev/null    || error "numpy failed to import."
-"$VENV_DIR/bin/python" -c "import curses" 2>/dev/null   || error "curses not available (should be built into Python)."
+"$VENV_DIR/bin/python" -c "import curses" 2>/dev/null   || error "curses not available."
 ok "All dependencies verified"
 
 # ── install auditerm ────────────────────────────────────────────
 info "Installing auditerm..."
 (
     cd "$CLONE_DIR"
-    "$VENV_DIR/bin/pip" install . 2>&1
+    "$VENV_DIR/bin/pip" install . -q 2>&1
 ) &
-spinner $! "Installing auditerm package..."
+spinner $! "Installing auditerm..."
 wait $! || error "Failed to install auditerm."
 ok "auditerm installed"
 
 # ── wrapper script ──────────────────────────────────────────────
-info "Creating launcher at $BIN_DIR/auditerm..."
+info "Creating launcher..."
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/auditerm" << EOF
 #!/usr/bin/env bash
 exec "$VENV_DIR/bin/auditerm" "\$@"
 EOF
 chmod +x "$BIN_DIR/auditerm"
-ok "Launcher created"
+ok "Launcher created at $BIN_DIR/auditerm"
 
 # ── PATH check ──────────────────────────────────────────────────
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -159,11 +160,10 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
         echo "" >> "$SHELL_RC"
         echo "# auditerm" >> "$SHELL_RC"
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
-        ok "Added $BIN_DIR to PATH in $SHELL_RC"
-        warn "Run this to apply now: source $SHELL_RC"
+        ok "Added to PATH in $SHELL_RC"
+        warn "Apply now with: source $SHELL_RC"
     else
-        warn "Add this to your shell rc manually:"
-        echo '  export PATH="$HOME/.local/bin:$PATH"'
+        warn "Add this to your shell config: export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 else
     ok "$BIN_DIR already in PATH"
