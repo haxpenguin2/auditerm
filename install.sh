@@ -2,7 +2,7 @@
 # auditerm installer
 # Usage: bash <(curl -fsSL https://raw.githubusercontent.com/haxpenguin2/auditerm/main/install.sh)
 
-set -e
+set -euo pipefail
 
 REPO="https://github.com/haxpenguin2/auditerm"
 CLONE_DIR="/tmp/auditerm_install"
@@ -22,11 +22,18 @@ warn()  { echo -e "${YLW}⚠ ${RST}$*"; }
 error() { echo -e "${RED}✘ ${RST}$*" >&2; exit 1; }
 step()  { echo -e "${DIM}  → $*${RST}"; }
 
+cleanup() {
+    rm -rf "$CLONE_DIR" 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+}
+trap cleanup EXIT
+
 spinner() {
     local pid=$1
     local msg=$2
     local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
+
     tput civis 2>/dev/null || true
     while kill -0 "$pid" 2>/dev/null; do
         local c="${spin:$((i % ${#spin})):1}"
@@ -34,8 +41,83 @@ spinner() {
         sleep 0.1
         ((i++)) || true
     done
-    printf "\r%-60s\r" " "
+    printf "\r%-80s\r" " "
     tput cnorm 2>/dev/null || true
+}
+
+run_with_spinner() {
+    local msg="$1"
+    shift
+
+    ( "$@" ) &
+    local pid=$!
+    spinner "$pid" "$msg"
+    wait "$pid"
+}
+
+detect_pkg_manager() {
+    if command -v pacman >/dev/null 2>&1; then
+        echo "pacman"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v zypper >/dev/null 2>&1; then
+        echo "zypper"
+    elif command -v apk >/dev/null 2>&1; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+install_system_pygame() {
+    case "$(detect_pkg_manager)" in
+        pacman)
+            command -v sudo >/dev/null 2>&1 || error "sudo is required to install python-pygame from pacman."
+            sudo pacman -Sy --needed --noconfirm python-pygame
+            ;;
+        apt)
+            command -v sudo >/dev/null 2>&1 || error "sudo is required to install python3-pygame from apt."
+            sudo apt-get update
+            sudo apt-get install -y python3-pygame
+            ;;
+        dnf)
+            command -v sudo >/dev/null 2>&1 || error "sudo is required to install python3-pygame from dnf."
+            sudo dnf install -y python3-pygame
+            ;;
+        zypper)
+            command -v sudo >/dev/null 2>&1 || error "sudo is required to install python3-pygame from zypper."
+            sudo zypper --non-interactive install python3-pygame
+            ;;
+        apk)
+            command -v sudo >/dev/null 2>&1 || error "sudo is required to install py3-pygame from apk."
+            sudo apk add py3-pygame
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+add_system_python_path_to_venv() {
+    local system_path venv_site
+
+    system_path="$(python3 - <<'PY'
+import os
+import pygame
+print(os.path.dirname(os.path.dirname(os.path.abspath(pygame.__file__))))
+PY
+)"
+
+    venv_site="$("$VENV_DIR/bin/python" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)"
+
+    mkdir -p "$venv_site"
+    printf '%s\n' "$system_path" > "$venv_site/system-pygame.pth"
 }
 
 echo ""
@@ -48,20 +130,18 @@ echo ""
 info "Checking system dependencies..."
 
 command -v python3 >/dev/null 2>&1 || error "python3 is required. Install: sudo pacman -S python"
-command -v git     >/dev/null 2>&1 || error "git is required. Install: sudo pacman -S git"
-command -v curl    >/dev/null 2>&1 || error "curl is required. Install: sudo pacman -S curl"
+command -v git >/dev/null 2>&1 || error "git is required. Install: sudo pacman -S git"
+command -v curl >/dev/null 2>&1 || error "curl is required. Install: sudo pacman -S curl"
+
+python3 -m venv --help >/dev/null 2>&1 || error "python venv module missing. Install: sudo pacman -S python"
 
 PY=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 ok "Python $PY found"
 
-python3 -m venv --help >/dev/null 2>&1 || error "python venv module missing. Install: sudo pacman -S python"
-
 # ── clone repo ──────────────────────────────────────────────────
 info "Cloning auditerm..."
 rm -rf "$CLONE_DIR"
-(git clone --depth=1 "$REPO" "$CLONE_DIR" 2>&1) &
-spinner $! "Cloning repository..."
-wait $! || error "Failed to clone repository."
+run_with_spinner "Cloning repository..." git clone --depth=1 "$REPO" "$CLONE_DIR"
 ok "Repository cloned"
 
 # ── create venv ─────────────────────────────────────────────────
@@ -72,78 +152,60 @@ python3 -m venv "$VENV_DIR"
 ok "Virtual environment ready"
 
 # ── upgrade pip quietly ─────────────────────────────────────────
-("$VENV_DIR/bin/pip" install --upgrade pip -q 2>&1) &
-spinner $! "Upgrading pip..."
-wait $! || true
-ok "pip ready"
+info "Upgrading pip..."
+if ! run_with_spinner "Upgrading pip..." "$VENV_DIR/bin/pip" install --upgrade pip -q; then
+    warn "pip upgrade failed, continuing anyway"
+else
+    ok "pip ready"
+fi
 
-# ── install mutagen (pure python, fast) ─────────────────────────
+# ── install mutagen ──────────────────────────────────────────────
 info "Installing mutagen..."
-(
-    "$VENV_DIR/bin/pip" install mutagen -q 2>&1
-) &
-spinner $! "Installing mutagen..."
-wait $! || error "Failed to install mutagen."
+run_with_spinner "Installing mutagen..." "$VENV_DIR/bin/pip" install mutagen -q
 ok "mutagen installed"
 
-# ── install numpy (prebuilt wheel) ──────────────────────────────
+# ── install numpy ───────────────────────────────────────────────
 info "Installing numpy..."
-(
-    "$VENV_DIR/bin/pip" install "numpy" --only-binary=:all: -q 2>&1
-) &
-spinner $! "Installing numpy..."
-wait $! || error "Failed to install numpy (no prebuilt wheel for Python $PY). Try: sudo pacman -S python-numpy"
-ok "numpy installed"
-
-# ── install pygame-ce (has wheels for Python 3.13+) ─────────────
-info "Installing pygame-ce (prebuilt wheel, no compilation)..."
-step "pygame-ce is a drop-in replacement for pygame with Python 3.13/3.14 support"
-(
-    "$VENV_DIR/bin/pip" install pygame-ce --only-binary=:all: -q 2>&1
-) &
-spinner $! "Installing pygame-ce..."
-if ! wait $!; then
-    warn "pygame-ce prebuilt wheel not found for Python $PY, falling back to system pygame..."
-    if command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --noconfirm python-pygame || error "Could not install pygame. Try manually: sudo pacman -S python-pygame"
-        PY_VER=$(python3 -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')")
-        SITE_PKGS="$VENV_DIR/lib/$PY_VER/site-packages"
-        SYS_PYGAME=$(python3 -c "import pygame; import os; print(os.path.dirname(pygame.__file__))" 2>/dev/null || true)
-        if [[ -n "$SYS_PYGAME" ]]; then
-            ln -sfn "$SYS_PYGAME" "$SITE_PKGS/pygame"
-            ok "Linked system pygame into venv"
-        else
-            error "Could not locate system pygame after install."
-        fi
-    else
-        error "No prebuilt pygame wheel for Python $PY and pacman not found."
-    fi
+if run_with_spinner "Installing numpy..." "$VENV_DIR/bin/pip" install numpy --only-binary=:all: -q; then
+    ok "numpy installed"
 else
+    error "Failed to install numpy (no prebuilt wheel for Python $PY). Try: sudo pacman -S python-numpy"
+fi
+
+# ── install pygame ──────────────────────────────────────────────
+info "Installing pygame..."
+step "Trying prebuilt pygame-ce wheel first"
+
+if run_with_spinner "Installing pygame-ce..." "$VENV_DIR/bin/pip" install pygame-ce --only-binary=:all: -q; then
     ok "pygame-ce installed"
+else
+    warn "No prebuilt pygame-ce wheel found for Python $PY. Falling back to system package manager..."
+
+    if install_system_pygame; then
+        add_system_python_path_to_venv
+        ok "System pygame installed and linked into the venv"
+    else
+        error "Could not install pygame from package repositories."
+    fi
 fi
 
 # ── verify imports ──────────────────────────────────────────────
 info "Verifying dependencies..."
-"$VENV_DIR/bin/python" -c "import pygame" 2>/dev/null   || error "pygame failed to import."
-"$VENV_DIR/bin/python" -c "import mutagen" 2>/dev/null  || error "mutagen failed to import."
-"$VENV_DIR/bin/python" -c "import numpy" 2>/dev/null    || error "numpy failed to import."
-"$VENV_DIR/bin/python" -c "import curses" 2>/dev/null   || error "curses not available."
+"$VENV_DIR/bin/python" -c "import pygame" 2>/dev/null || error "pygame failed to import."
+"$VENV_DIR/bin/python" -c "import mutagen" 2>/dev/null || error "mutagen failed to import."
+"$VENV_DIR/bin/python" -c "import numpy" 2>/dev/null || error "numpy failed to import."
+"$VENV_DIR/bin/python" -c "import curses" 2>/dev/null || error "curses not available."
 ok "All dependencies verified"
 
 # ── install auditerm ────────────────────────────────────────────
 info "Installing auditerm..."
-(
-    cd "$CLONE_DIR"
-    "$VENV_DIR/bin/pip" install . -q 2>&1
-) &
-spinner $! "Installing auditerm..."
-wait $! || error "Failed to install auditerm."
+run_with_spinner "Installing auditerm..." bash -lc "cd '$CLONE_DIR' && '$VENV_DIR/bin/pip' install . -q"
 ok "auditerm installed"
 
 # ── wrapper script ──────────────────────────────────────────────
 info "Creating launcher..."
 mkdir -p "$BIN_DIR"
-cat > "$BIN_DIR/auditerm" << EOF
+cat > "$BIN_DIR/auditerm" <<EOF
 #!/usr/bin/env bash
 exec "$VENV_DIR/bin/auditerm" "\$@"
 EOF
@@ -153,24 +215,32 @@ ok "Launcher created at $BIN_DIR/auditerm"
 # ── PATH check ──────────────────────────────────────────────────
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn "$BIN_DIR is not in your PATH"
+
     SHELL_RC=""
-    [[ -f "$HOME/.bashrc" ]] && SHELL_RC="$HOME/.bashrc"
-    [[ -f "$HOME/.zshrc"  ]] && SHELL_RC="$HOME/.zshrc"
+    case "${SHELL:-}" in
+        */zsh)  [[ -f "$HOME/.zshrc" ]]  && SHELL_RC="$HOME/.zshrc" ;;
+        */bash) [[ -f "$HOME/.bashrc" ]] && SHELL_RC="$HOME/.bashrc" ;;
+    esac
+
+    if [[ -z "$SHELL_RC" ]]; then
+        [[ -f "$HOME/.bashrc" ]] && SHELL_RC="$HOME/.bashrc"
+        [[ -f "$HOME/.zshrc" ]]  && SHELL_RC="$HOME/.zshrc"
+    fi
+
     if [[ -n "$SHELL_RC" ]]; then
-        echo "" >> "$SHELL_RC"
-        echo "# auditerm" >> "$SHELL_RC"
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+        if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$SHELL_RC" 2>/dev/null; then
+            echo "" >> "$SHELL_RC"
+            echo "# auditerm" >> "$SHELL_RC"
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+        fi
         ok "Added to PATH in $SHELL_RC"
         warn "Apply now with: source $SHELL_RC"
     else
-        warn "Add this to your shell config: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        warn 'Add this to your shell config: export PATH="$HOME/.local/bin:$PATH"'
     fi
 else
     ok "$BIN_DIR already in PATH"
 fi
-
-# ── cleanup ─────────────────────────────────────────────────────
-rm -rf "$CLONE_DIR"
 
 echo ""
 echo -e "${GRN}╔══════════════════════════════════════╗${RST}"
