@@ -1,14 +1,15 @@
 """
-Audio playback engine using pygame.mixer.
-Wraps play/pause/stop/volume/seek and exposes current position.
+Audio playback engine using pygame.mixer with raw sample exposure for FFT.
 """
 
 import threading
 import time
 from pathlib import Path
+import numpy as np
 
 try:
     import pygame
+    # Initialize with specific buffer for lower latency
     pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
     pygame.mixer.init()
     PYGAME_OK = True
@@ -53,9 +54,6 @@ class Track:
             return f"{self.artist} — {self.title}"
         return self.filename
 
-    def duration_str(self) -> str:
-        return _fmt_time(self.duration)
-
 
 def _fmt_time(seconds: float) -> str:
     s = int(seconds)
@@ -69,7 +67,7 @@ def _fmt_time(seconds: float) -> str:
 class Player:
     """
     Stateful audio player.
-    Thread-safe; uses a background monitor thread to detect track end.
+    Exposes self.raw_samples for the visualizer.
     """
 
     def __init__(self):
@@ -80,9 +78,12 @@ class Player:
         self._playing = False
         self._paused = False
         self._volume = 0.8
-        self._start_time = 0.0        # wall time when playback started
-        self._elapsed_at_pause = 0.0  # accumulated elapsed before pause
-        self._on_track_end = None     # callback()
+        self._start_time = 0.0
+        self._elapsed_at_pause = 0.0
+        self._on_track_end = None
+
+        # Buffer for visualizer
+        self.raw_samples = np.array([], dtype=np.float32)
 
         self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
         self._monitor_thread.start()
@@ -94,45 +95,35 @@ class Player:
             self._queue = tracks
             self._queue_index = index
 
-    def add_to_queue(self, track: Track):
+    def play(self, track: Track | None = None):
+        if not PYGAME_OK:
+            return
         with self._lock:
-            self._queue.append(track)
+            if track:
+                self._track = track
+            if self._track is None:
+                return
+            try:
+                # Standard playback
+                pygame.mixer.music.load(self._track.path)
+                pygame.mixer.music.set_volume(self._volume)
+                pygame.mixer.music.play()
 
-    def clear_queue(self):
-        with self._lock:
-            self._queue.clear()
-            self._queue_index = -1
+                # Extract raw samples for FFT analysis
+                sound = pygame.mixer.Sound(self._track.path)
+                # Convert to numpy array and normalize to mono if needed
+                samples = pygame.sndarray.array(sound)
+                if len(samples.shape) > 1:
+                    self.raw_samples = samples.mean(axis=1)
+                else:
+                    self.raw_samples = samples
 
-    # ── playback controls ─────────────────────────────────────────
-
-    import numpy as np
-
-# Inside your Player class...
-def play(self, track: Track | None = None):
-    if not PYGAME_OK: return
-    with self._lock:
-        if track: self._track = track
-        if self._track is None: return
-        try:
-            # Play the music normally
-            pygame.mixer.music.load(self._track.path)
-            pygame.mixer.music.play()
-
-            # NEW: Load raw data for the visualizer
-            # We load it as a Sound object to get the raw buffer
-            sound = pygame.mixer.Sound(self._track.path)
-            self.raw_samples = pygame.sndarray.array(sound)
-            # If stereo, average to mono for easier processing
-            if len(self.raw_samples.shape) > 1:
-                self.raw_samples = self.raw_samples.mean(axis=1)
-
-            self._playing = True
-            self._paused = False
-            self._start_time = time.time()
-            self._elapsed_at_pause = 0.0
-        except Exception as e:
-            print(f"Error loading audio data: {e}")
-            self._playing = False
+                self._playing = True
+                self._paused = False
+                self._start_time = time.time()
+                self._elapsed_at_pause = 0.0
+            except Exception:
+                self._playing = False
 
     def pause(self):
         if not PYGAME_OK or not self._playing:
@@ -174,30 +165,9 @@ def play(self, track: Track | None = None):
         self.play(track)
         return True
 
-    def set_volume(self, v: float):
-        self._volume = max(0.0, min(1.0, v))
-        if PYGAME_OK:
-            pygame.mixer.music.set_volume(self._volume)
-
-    def volume_up(self, step=0.05):
-        self.set_volume(self._volume + step)
-
-    def volume_down(self, step=0.05):
-        self.set_volume(self._volume - step)
-
-    # ── state getters ─────────────────────────────────────────────
-
     @property
     def is_playing(self) -> bool:
         return self._playing and not self._paused
-
-    @property
-    def is_paused(self) -> bool:
-        return self._paused
-
-    @property
-    def current_track(self) -> Track | None:
-        return self._track
 
     @property
     def elapsed(self) -> float:
@@ -207,27 +177,11 @@ def play(self, track: Track | None = None):
             return self._elapsed_at_pause
         return self._elapsed_at_pause + (time.time() - self._start_time)
 
-    @property
-    def volume(self) -> float:
-        return self._volume
-
-    @property
-    def progress(self) -> float:
-        """0.0 – 1.0"""
-        if self._track and self._track.duration > 0:
-            return min(1.0, self.elapsed / self._track.duration)
-        return 0.0
-
-    def elapsed_str(self) -> str:
-        return _fmt_time(self.elapsed)
-
     def on_track_end(self, cb):
         self._on_track_end = cb
 
-    # ── background monitor ────────────────────────────────────────
-
     def _monitor(self):
-        """Detect natural end of track and auto-advance."""
+        """Monitor for track end and auto-advance."""
         while True:
             time.sleep(0.25)
             if not PYGAME_OK:
@@ -237,9 +191,10 @@ def play(self, track: Track | None = None):
                 paused = self._paused
             if playing and not paused:
                 if not pygame.mixer.music.get_busy():
-                    # track ended naturally
                     with self._lock:
                         self._playing = False
                         self._elapsed_at_pause = 0.0
                     if self._on_track_end:
                         self._on_track_end()
+                    else:
+                        self.next_track()
