@@ -90,11 +90,17 @@ def _name_to_curses(name: str) -> int:
         "cyan":    curses.COLOR_CYAN,
         "white":   curses.COLOR_WHITE,
     }
+
     try:
-        return mapping.get(name.lower(), int(name))
+        name_lower = name.lower()
+        # Check if the name is in our dictionary first
+        if name_lower in mapping:
+            return mapping[name_lower]
+
+        # Only try to cast to an integer if it wasn't a recognized string
+        return int(name)
     except (ValueError, AttributeError):
         return curses.COLOR_WHITE
-
 
 class Config:
     def __init__(self):
