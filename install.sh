@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="https://github.com/YOUR_USERNAME/auditerm"
+REPO="https://github.com/haxpenguin2/auditerm"
 CLONE_DIR="/tmp/auditerm_install"
 VENV_DIR="$HOME/.local/share/auditerm/venv"
 BIN_DIR="$HOME/.local/bin"
