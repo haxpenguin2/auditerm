@@ -6,7 +6,8 @@ set -euo pipefail
 
 REPO="https://github.com/haxpenguin2/auditerm"
 CLONE_DIR="$(mktemp -d /tmp/auditerm_install.XXXXXX)"
-VENV_DIR="$HOME/.local/share/auditerm/venv"
+BASE_DIR="$HOME/.local/share/auditerm"
+VENV_DIR="$BASE_DIR/venv"
 BIN_DIR="$HOME/.local/bin"
 
 RED='\033[0;31m'
@@ -48,7 +49,6 @@ spinner() {
 run_with_spinner() {
     local msg="$1"
     shift
-
     ( "$@" ) &
     local pid=$!
     spinner "$pid" "$msg"
@@ -120,6 +120,13 @@ PY
     printf '%s\n' "$system_site" > "$venv_site/system-pygame.pth"
 }
 
+purge_previous_install() {
+    info "Removing previous auditerm install..."
+    rm -f "$BIN_DIR/auditerm"
+    rm -rf "$BASE_DIR"
+    ok "Previous auditerm install removed"
+}
+
 echo ""
 echo -e "${CYN}╔══════════════════════════════════════╗${RST}"
 echo -e "${CYN}║       auditerm  installer            ║${RST}"
@@ -138,6 +145,8 @@ python3 -m venv --help >/dev/null 2>&1 || error "python venv module missing. Ins
 PY=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 ok "Python $PY found"
 
+purge_previous_install
+
 # ── clone repo ──────────────────────────────────────────────────
 info "Cloning auditerm..."
 run_with_spinner "Cloning repository..." git clone --depth=1 "$REPO" "$CLONE_DIR"
@@ -145,8 +154,7 @@ ok "Repository cloned"
 
 # ── create venv ─────────────────────────────────────────────────
 info "Creating virtual environment..."
-mkdir -p "$(dirname "$VENV_DIR")"
-rm -rf "$VENV_DIR"
+mkdir -p "$BASE_DIR"
 python3 -m venv "$VENV_DIR"
 ok "Virtual environment ready"
 
@@ -179,7 +187,6 @@ if run_with_spinner "Installing pygame-ce..." "$VENV_DIR/bin/pip" install pygame
     ok "pygame-ce installed"
 else
     warn "No prebuilt pygame-ce wheel found for Python $PY. Falling back to system package manager..."
-
     if install_system_pygame; then
         add_system_python_path_to_venv
         ok "System pygame installed and linked into the venv"
@@ -198,7 +205,7 @@ ok "All dependencies verified"
 
 # ── install auditerm ────────────────────────────────────────────
 info "Installing auditerm..."
-run_with_spinner "Installing auditerm..." bash -lc "cd '$CLONE_DIR' && '$VENV_DIR/bin/pip' install --no-deps . -q"
+run_with_spinner "Installing auditerm..." bash -lc "cd '$CLONE_DIR' && '$VENV_DIR/bin/pip' install --no-deps --no-build-isolation . -q"
 ok "auditerm installed"
 
 # ── wrapper script ──────────────────────────────────────────────
@@ -223,7 +230,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
 
     if [[ -z "$SHELL_RC" ]]; then
         [[ -f "$HOME/.bashrc" ]] && SHELL_RC="$HOME/.bashrc"
-        [[ -f "$HOME/.zshrc" ]]  && SHELL_RC="$HOME/.zshrc"
+        [[ -f "$HOME/.zshrc" ]] && SHELL_RC="$HOME/.zshrc"
     fi
 
     if [[ -n "$SHELL_RC" ]]; then
