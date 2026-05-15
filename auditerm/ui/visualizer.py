@@ -14,28 +14,28 @@ class Visualizer:
         self.smooth_blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
     def _generate_bands(self, n: int) -> list[float]:
-    p = self.player
-    if not (p.is_playing):
-        return [max(0, b - 0.1) for b in self._bands] # Fade out
+        p = self.player
+        if not (p.is_playing):
+            return [max(0, b - 0.1) for b in self._bands] # Fade out
 
     # We use a mix of the current timestamp and random seeds
     # to create "peaks" that feel intentional.
-    t = p.elapsed * 10
-    bands = []
-    for i in range(n):
+        t = p.elapsed * 10
+        bands = []
+        for i in range(n):
         # Create a "pseudo-frequency" by combining waves
         # This makes different bands react at different speeds
-        sig = math.sin(t * (i * 0.1 + 1)) * math.cos(t * 0.5)
-        sig = abs(sig) # Only positive bars
+            sig = math.sin(t * (i * 0.1 + 1)) * math.cos(t * 0.5)
+            sig = abs(sig) # Only positive bars
 
         # Add a "kick" every second to simulate a beat
-        beat = 0.4 if (int(p.elapsed * 2) % 2 == 0) else 0.0
+            beat = 0.4 if (int(p.elapsed * 2) % 2 == 0) else 0.0
 
-        val = (sig * 0.6) + beat + (random.random() * 0.1)
-        bands.append(min(1.0, val))
+            val = (sig * 0.6) + beat + (random.random() * 0.1)
+            bands.append(min(1.0, val))
 
-    self._bands = bands
-    return bands
+        self._bands = bands
+        return bands
 
     def draw(self, win):
         win.erase()
