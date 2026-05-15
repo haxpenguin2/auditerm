@@ -105,24 +105,34 @@ class Player:
 
     # ── playback controls ─────────────────────────────────────────
 
-    def play(self, track: Track | None = None):
-        if not PYGAME_OK:
-            return
-        with self._lock:
-            if track:
-                self._track = track
-            if self._track is None:
-                return
-            try:
-                pygame.mixer.music.load(self._track.path)
-                pygame.mixer.music.set_volume(self._volume)
-                pygame.mixer.music.play()
-                self._playing = True
-                self._paused = False
-                self._start_time = time.time()
-                self._elapsed_at_pause = 0.0
-            except Exception:
-                self._playing = False
+    import numpy as np
+
+# Inside your Player class...
+def play(self, track: Track | None = None):
+    if not PYGAME_OK: return
+    with self._lock:
+        if track: self._track = track
+        if self._track is None: return
+        try:
+            # Play the music normally
+            pygame.mixer.music.load(self._track.path)
+            pygame.mixer.music.play()
+
+            # NEW: Load raw data for the visualizer
+            # We load it as a Sound object to get the raw buffer
+            sound = pygame.mixer.Sound(self._track.path)
+            self.raw_samples = pygame.sndarray.array(sound)
+            # If stereo, average to mono for easier processing
+            if len(self.raw_samples.shape) > 1:
+                self.raw_samples = self.raw_samples.mean(axis=1)
+
+            self._playing = True
+            self._paused = False
+            self._start_time = time.time()
+            self._elapsed_at_pause = 0.0
+        except Exception as e:
+            print(f"Error loading audio data: {e}")
+            self._playing = False
 
     def pause(self):
         if not PYGAME_OK or not self._playing:
