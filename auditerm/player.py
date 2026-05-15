@@ -67,7 +67,7 @@ def _fmt_time(seconds: float) -> str:
 class Player:
     """
     Stateful audio player.
-    Exposes self.raw_samples for the visualizer.
+    Exposes self.raw_samples for the visualizer and properties for the UI.
     """
 
     def __init__(self):
@@ -111,7 +111,6 @@ class Player:
 
                 # Extract raw samples for FFT analysis
                 sound = pygame.mixer.Sound(self._track.path)
-                # Convert to numpy array and normalize to mono if needed
                 samples = pygame.sndarray.array(sound)
                 if len(samples.shape) > 1:
                     self.raw_samples = samples.mean(axis=1)
@@ -165,9 +164,28 @@ class Player:
         self.play(track)
         return True
 
+    def set_volume(self, v: float):
+        self._volume = max(0.0, min(1.0, v))
+        if PYGAME_OK:
+            pygame.mixer.music.set_volume(self._volume)
+
+    # ── state getters ─────────────────────────────────────────────
+
     @property
     def is_playing(self) -> bool:
         return self._playing and not self._paused
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def current_track(self) -> Track | None:
+        return self._track
+
+    @property
+    def volume(self) -> float:
+        return self._volume
 
     @property
     def elapsed(self) -> float:
@@ -177,8 +195,17 @@ class Player:
             return self._elapsed_at_pause
         return self._elapsed_at_pause + (time.time() - self._start_time)
 
+    @property
+    def progress(self) -> float:
+        """0.0 – 1.0"""
+        if self._track and self._track.duration > 0:
+            return min(1.0, self.elapsed / self._track.duration)
+        return 0.0
+
     def on_track_end(self, cb):
         self._on_track_end = cb
+
+    # ── background monitor ────────────────────────────────────────
 
     def _monitor(self):
         """Monitor for track end and auto-advance."""
