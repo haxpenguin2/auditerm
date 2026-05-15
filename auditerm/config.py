@@ -1,59 +1,114 @@
 """
 Config loader for auditerm.
 Reads ~/.config/auditerm/config (INI-style).
+
+Config format:
+
+[app]
+start_dir = /home/alice
+volume    = 75          # 0-100
+
+[theme]
+border       = red
+title        = white
+text         = white
+muted        = blue
+highlight    = black
+highlight_bg = cyan
+status       = red
+warning      = yellow
+error        = red
+visualizer   = cyan
+
+[visualizer]
+style    = bars         # bars | mirror | wave | dots | off
+bars     = 40           # number of frequency bars (overridden by terminal width)
+height   = 8            # rows tall
+fps      = 20
+gain     = 14.0
+gravity  = 0.035
+smoothing= 0.75
+monstercat = 1.8
+peak_mode = rms         # rms | peak (how to normalize FFT bands)
+
+[browser]
+show_hidden = false
+sort        = name      # name | ext | size
+
+[ui]
+default_panel  = split  # split | browser | library
+show_help_bar  = true
+progress_style = bar    # bar | dots | minimal
+title_art      = true
+unicode_icons  = true
+border_style   = single # single | double | rounded | ascii
+
+[keybinds]
+quit         = q
+stop         = s
+next         = >
+prev         = <
+volume_up    = +
+volume_down  = -
+browser      = b
+library      = l
+visualizer   = v
+add_to_album = a
+new_album    = n
 """
 
 from __future__ import annotations
 import configparser
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "auditerm"
+CONFIG_DIR  = Path.home() / ".config" / "auditerm"
 CONFIG_FILE = CONFIG_DIR / "config"
 
 DEFAULTS: dict[str, dict[str, str]] = {
-    "general": {
-        "music_dir":     str(Path.home() / "Music"),
-        "remember_last": "true",
-        "last_path":     "",
+    "app": {
+        "start_dir": str(Path.home() / "Music"),
+        "volume":    "80",
     },
-    "colors": {
-        "bg":          "black",
-        "fg":          "white",
-        "accent":      "cyan",
-        "accent2":     "green",
-        "border":      "cyan",
-        "selected_bg": "cyan",
-        "selected_fg": "black",
-        "playing_fg":  "green",
-        "muted":       "white",
-        "error":       "red",
-        "title_fg":    "cyan",
-        "status_fg":   "green",
-        "bar_filled":  "cyan",
-        "bar_empty":   "white",
+    "theme": {
+        "border":       "cyan",
+        "title":        "cyan",
+        "text":         "white",
+        "muted":        "white",
+        "highlight":    "black",
+        "highlight_bg": "cyan",
+        "status":       "green",
+        "warning":      "yellow",
+        "error":        "red",
+        "visualizer":   "cyan",
+        "visualizer2":  "green",   # peak dot color
+        "playing":      "green",
+        "bar_empty":    "white",
     },
     "visualizer": {
         "style":       "bars",
+        "bars":        "40",
         "height":      "8",
         "fps":         "20",
         "gain":        "14.0",
         "gravity":     "0.035",
         "smoothing":   "0.75",
         "monstercat":  "1.8",
+        "peak_mode":   "rms",
+    },
+    "browser": {
+        "show_hidden": "false",
+        "sort":        "name",
     },
     "ui": {
-        "default_panel":    "split",
-        "show_help_bar":    "true",
-        "show_status_bar":  "true",
-        "progress_style":   "bar",
-        "time_format":      "elapsed",
-        "title_art":        "true",
-        "unicode_icons":    "true",
-        "border_style":     "single",
+        "default_panel":   "split",
+        "show_help_bar":   "true",
+        "progress_style":  "bar",
+        "title_art":       "true",
+        "unicode_icons":   "true",
+        "border_style":    "single",
     },
     "keybinds": {
         "quit":         "q",
-        "play_pause":   " ",
         "stop":         "s",
         "next":         ">",
         "prev":         "<",
@@ -101,10 +156,7 @@ class Config:
         self._load()
 
     def _load(self):
-        # Step 1: load hardcoded defaults
         self._parser.read_dict(DEFAULTS)
-        # Step 2: overlay user file on top — only keys present in the
-        # file will change; everything else keeps its default value
         if CONFIG_FILE.exists():
             try:
                 self._parser.read(str(CONFIG_FILE), encoding="utf-8")
@@ -113,6 +165,8 @@ class Config:
 
     def reload(self):
         self._load()
+
+    # ── generic accessors ─────────────────────────────────────────
 
     def get(self, section: str, key: str, fallback: str | None = None) -> str | None:
         try:
@@ -138,14 +192,57 @@ class Config:
         except Exception:
             return fallback
 
-    def color(self, key: str) -> int:
-        name = self.get("colors", key, "white") or "white"
-        return _name_to_curses(name)
-
     def set(self, section: str, key: str, value: str):
         if not self._parser.has_section(section):
             self._parser.add_section(section)
         self._parser.set(section, key, value)
+
+    # ── theme/color helpers ───────────────────────────────────────
+    # These map the [theme] key names to what colors.py expects.
+
+    def color(self, key: str) -> int:
+        """
+        key is one of the old [colors] names used internally.
+        We map them to [theme] keys from the user's config.
+        """
+        _THEME_MAP = {
+            # internal key      → [theme] key
+            "bg":           ("theme", "text",         "black"),
+            "fg":           ("theme", "text",         "white"),
+            "accent":       ("theme", "visualizer",   "cyan"),
+            "accent2":      ("theme", "visualizer2",  "green"),
+            "border":       ("theme", "border",       "cyan"),
+            "selected_bg":  ("theme", "highlight_bg", "cyan"),
+            "selected_fg":  ("theme", "highlight",    "black"),
+            "playing_fg":   ("theme", "playing",      "green"),
+            "muted":        ("theme", "muted",        "white"),
+            "error":        ("theme", "error",        "red"),
+            "title_fg":     ("theme", "title",        "cyan"),
+            "status_fg":    ("theme", "status",       "green"),
+            "bar_filled":   ("theme", "visualizer",   "cyan"),
+            "bar_empty":    ("theme", "bar_empty",    "white"),
+        }
+        if key in _THEME_MAP:
+            section, theme_key, default = _THEME_MAP[key]
+            name = self.get(section, theme_key, default) or default
+        else:
+            name = self.get("theme", key, "white") or "white"
+        return _name_to_curses(name)
+
+    # ── convenience: old-style section getters ────────────────────
+    # These let the rest of the code use cfg.get("ui", ...) etc.
+    # but also transparently read from [app] / [theme] / [browser].
+
+    @property
+    def music_dir(self) -> str:
+        d = self.get("app", "start_dir", str(Path.home() / "Music")) or ""
+        p = Path(d).expanduser()
+        return str(p) if p.exists() else str(Path.home())
+
+    @property
+    def start_volume(self) -> float:
+        v = self.getint("app", "volume", 80)
+        return max(0, min(100, v)) / 100.0
 
     def write_default(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -156,54 +253,57 @@ class Config:
 _DEFAULT_CONFIG_TEXT = """\
 # auditerm configuration
 # ~/.config/auditerm/config
-# Uncomment any line to override the default.
 
-[general]
-# music_dir     = ~/Music
+[app]
+start_dir = ~/Music
+volume    = 80          # 0-100
 
-[colors]
-# bg            = black
-# fg            = white
-# accent        = cyan
-# accent2       = green
-# border        = cyan
-# selected_bg   = cyan
-# selected_fg   = black
-# playing_fg    = green
-# muted         = white
-# error         = red
-# title_fg      = cyan
-# status_fg     = green
-# bar_filled    = cyan
-# bar_empty     = white
+[theme]
+border       = cyan
+title        = cyan
+text         = white
+muted        = white
+highlight    = black
+highlight_bg = cyan
+status       = green
+warning      = yellow
+error        = red
+visualizer   = cyan     # bar fill color
+visualizer2  = green    # peak dot color
+playing      = green
 
 [visualizer]
-# style         = bars        # bars | mirror | wave | dots | off
-# height        = 8
-# fps           = 20
-# gain          = 14.0        # raise if bars look flat
-# gravity       = 0.035       # fall speed
-# smoothing     = 0.75        # rise smoothing
-# monstercat    = 1.8         # lateral flow between bars
+style      = bars       # bars | mirror | wave | dots | off
+height     = 8          # rows tall
+fps        = 20
+gain       = 14.0       # raise if bars look flat
+gravity    = 0.035      # fall speed (lower = floatier)
+smoothing  = 0.75       # rise smoothing
+monstercat = 1.8        # lateral flow between bars
+peak_mode  = rms        # rms | peak
+
+[browser]
+show_hidden = false
+sort        = name      # name | ext | size
 
 [ui]
-# default_panel  = split      # split | browser | library
-# show_help_bar  = true
-# progress_style = bar        # bar | dots | minimal
-# title_art      = true
-# unicode_icons  = true
-# border_style   = single     # single | double | rounded | ascii
+default_panel  = split  # split | browser | library
+show_help_bar  = true
+progress_style = bar    # bar | dots | minimal
+title_art      = true
+unicode_icons  = true
+border_style   = single # single | double | rounded | ascii
 
 [keybinds]
-# quit           = q
-# stop           = s
-# next           = >
-# prev           = <
-# volume_up      = +
-# volume_down    = -
-# browser        = b
-# library        = l
-# visualizer     = v
-# add_to_album   = a
-# new_album      = n
+quit         = q
+stop         = s
+next         = >
+prev         = <
+volume_up    = +
+volume_down  = -
+browser      = b
+library      = l
+visualizer   = v
+add_to_album = a
+new_album    = n
 """
