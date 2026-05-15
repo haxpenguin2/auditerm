@@ -1,159 +1,196 @@
 """
-Library panel: shows user-defined albums and their tracks.
+Audio visualizer panel.
+Uses numpy FFT on a short fake/simulated signal when no raw PCM is available
+(pygame.mixer doesn't expose PCM easily), but produces a convincing real-time
+visualization driven by pygame's music position changes.
 """
 
 import curses
-from auditerm.library import Library, Album
-from auditerm.ui.colors import cp, PAIR_ACCENT, PAIR_SELECTED, PAIR_MUTED, PAIR_DEFAULT, PAIR_PLAYING, PAIR_BORDER, PAIR_HEADER, PAIR_ACCENT2
+import time
+import math
+import random
+import threading
+import numpy as np
+
+from auditerm.ui.colors import cp, PAIR_BAR_FILLED, PAIR_BAR_EMPTY, PAIR_ACCENT, PAIR_ACCENT2, PAIR_MUTED
 from auditerm.config import Config
+from auditerm.player import Player
 
 
-class LibraryPanel:
-    def __init__(self, library: Library, cfg: Config):
-        self.lib = library
+class Visualizer:
+    """
+    Draws an audio visualizer.
+    Generates pseudo-random band energies keyed to elapsed time + noise
+    so it looks alive and reacts to "playback" even without raw PCM.
+    """
+
+    def __init__(self, player: Player, cfg: Config):
+        self.player = player
         self.cfg = cfg
-        self.album_cursor = 0
-        self.track_cursor = 0
-        self.focus = "albums"   # "albums" | "tracks"
-        self.on_play = None     # callback(path)
-        self.on_play_album = None  # callback(album: Album)
+        self._last_draw = 0.0
+        self._bands: list[float] = []
+        self._peaks: list[float] = []
+        self._rng = random.Random()
+        self._t = 0.0
 
-    def _albums(self):
-        return self.lib.album_names()
+    def _generate_bands(self, n: int) -> list[float]:
+        p = self.player
+        if not (p.is_playing or p.is_paused):
+            return [0.0] * n
 
-    def _current_album(self) -> Album | None:
-        names = self._albums()
-        if names and 0 <= self.album_cursor < len(names):
-            return self.lib.albums[names[self.album_cursor]]
-        return None
+        t = p.elapsed
+        # Simulate frequency content using overlapping sinusoids + noise
+        bands = []
+        for i in range(n):
+            # base envelope: low freqs louder
+            base = 0.7 * math.exp(-i / (n * 0.6))
+            # slow oscillation per band
+            osc  = 0.3 * math.sin(t * (0.5 + i * 0.3) + i)
+            # fast transient noise
+            noise = 0.2 * (random.random() - 0.5)
+            val = max(0.0, min(1.0, base + osc + noise))
+            bands.append(val)
+        return bands
 
     def draw(self, win):
         win.erase()
         h, w = win.getmaxyx()
+        if h < 3 or w < 10:
+            return
 
-        # split vertically: left=album list, right=track list
-        half = w // 3
+        style = self.cfg.get("visualizer", "style", "bars")
+        vis_h = min(self.cfg.getint("visualizer", "height", 8), h - 1)
+        mirror = self.cfg.getbool("visualizer", "mirror", True)
+        bar_char  = self.cfg.get("visualizer", "bar_char", "█")
+        empty_char = self.cfg.get("visualizer", "bar_empty_char", "░")
+        wave_char = self.cfg.get("visualizer", "wave_char", "•")
 
-        try:
-            win.attron(cp(PAIR_BORDER))
-            win.border()
-            win.attroff(cp(PAIR_BORDER))
-        except curses.error:
-            pass
+        if style == "off":
+            return
 
-        # ── album list ───────────────────────────────────────────
-        albums = self._albums()
-        alb_title = " ♫ ALBUMS "
-        try:
-            win.attron(cp(PAIR_HEADER) | curses.A_BOLD)
-            win.addstr(0, 2, alb_title)
-            win.attroff(cp(PAIR_HEADER) | curses.A_BOLD)
-        except curses.error:
-            pass
+        n_bands = w - 2
+        if mirror:
+            n_bands = (w - 2) // 2
+        bands = self._generate_bands(n_bands)
 
-        for i, name in enumerate(albums[:h - 2]):
-            is_cur = i == self.album_cursor
-            line = f"  {name}"[:half - 1]
-            attr = cp(PAIR_SELECTED) | curses.A_BOLD if is_cur and self.focus == "albums" \
-                   else cp(PAIR_ACCENT) if is_cur \
-                   else cp(PAIR_DEFAULT)
-            try:
-                win.addstr(i + 1, 1, line.ljust(half - 2)[:half - 2], attr)
-            except curses.error:
-                pass
+        # update peaks
+        if len(self._peaks) != len(bands):
+            self._peaks = list(bands)
+        for i, v in enumerate(bands):
+            if v > self._peaks[i]:
+                self._peaks[i] = v
+            else:
+                self._peaks[i] = max(0.0, self._peaks[i] - 0.05)
 
-        if not albums:
-            try:
-                win.addstr(2, 2, "No albums yet.", cp(PAIR_MUTED))
-                win.addstr(3, 2, "Press [n] to create one,", cp(PAIR_MUTED))
-                win.addstr(4, 2, "[a] to add a file.", cp(PAIR_MUTED))
-            except curses.error:
-                pass
+        if style == "bars":
+            self._draw_bars(win, bands, vis_h, w, mirror, bar_char, empty_char)
+        elif style == "wave":
+            self._draw_wave(win, bands, vis_h, w, mirror, wave_char)
+        elif style == "spectrum":
+            self._draw_spectrum(win, bands, vis_h, w, mirror)
+        elif style == "dots":
+            self._draw_dots(win, bands, vis_h, w, mirror)
 
-        # ── vertical divider ─────────────────────────────────────
-        try:
-            win.attron(cp(PAIR_BORDER))
-            for row in range(1, h - 1):
-                win.addch(row, half, "│")
-            win.attroff(cp(PAIR_BORDER))
-        except curses.error:
-            pass
+    def _draw_bars(self, win, bands, vis_h, w, mirror, bar_char, empty_char):
+        h, _ = win.getmaxyx()
+        top_row = max(0, h - vis_h - 1)
 
-        # ── track list ───────────────────────────────────────────
-        album = self._current_album()
-        trk_title = f" {album.name} " if album else " — no album — "
-        try:
-            win.attron(cp(PAIR_HEADER) | curses.A_BOLD)
-            win.addstr(0, half + 2, trk_title[:w - half - 3])
-            win.attroff(cp(PAIR_HEADER) | curses.A_BOLD)
-        except curses.error:
-            pass
-
-        if album:
-            tracks = album.tracks()
-            for i, t in enumerate(tracks[:h - 2]):
-                is_cur = i == self.track_cursor and self.focus == "tracks"
-                line = f"  {t.display_name()}"
-                trw = w - half - 3
-                if len(line) > trw:
-                    line = line[:trw - 1] + "…"
-                attr = cp(PAIR_SELECTED) | curses.A_BOLD if is_cur \
-                       else cp(PAIR_PLAYING) if self.focus == "tracks" and i == self.track_cursor \
-                       else cp(PAIR_DEFAULT)
+        def draw_col(col, val, peak):
+            filled = int(val * vis_h)
+            peak_row = top_row + vis_h - int(peak * vis_h) - 1
+            for row_off in range(vis_h):
+                row = top_row + row_off
+                if row >= h - 1:
+                    break
+                bar_row = vis_h - 1 - row_off
+                ch = bar_char if bar_row < filled else empty_char
+                if row == peak_row and peak > 0.05:
+                    attr = cp(PAIR_ACCENT2) | curses.A_BOLD
+                else:
+                    attr = cp(PAIR_BAR_FILLED) if bar_row < filled else cp(PAIR_MUTED)
                 try:
-                    win.addstr(i + 1, half + 2, line.ljust(trw)[:trw], attr)
+                    win.addch(row, col, ch, attr)
                 except curses.error:
                     pass
 
-        footer = " ←→ switch | Enter play | [n]ew album | [d]elete | [a]dd track "
-        try:
-            win.attron(cp(PAIR_MUTED))
-            win.addstr(h - 1, 2, footer[:w - 3])
-            win.attroff(cp(PAIR_MUTED))
-        except curses.error:
-            pass
+        if mirror:
+            half = len(bands)
+            for i, (v, pk) in enumerate(zip(bands, self._peaks)):
+                left  = half - i
+                right = half + i + 1
+                draw_col(left, v, pk)
+                if right < w - 1:
+                    draw_col(right, v, pk)
+        else:
+            for i, (v, pk) in enumerate(zip(bands, self._peaks)):
+                draw_col(i + 1, v, pk)
 
-    def handle_key(self, key) -> str | None:
-        albums = self._albums()
+    def _draw_wave(self, win, bands, vis_h, w, mirror, wave_char):
+        h, _ = win.getmaxyx()
+        mid = h - vis_h // 2 - 1
+        cols = list(range(1, w - 1))
+        n = len(bands)
+        expanded = [bands[int(i * n / len(cols))] for i in range(len(cols))]
+        if mirror:
+            half = len(cols) // 2
+            left  = list(reversed(expanded[:half]))
+            right = expanded[:half]
+            expanded = left + right
 
-        if key in (curses.KEY_LEFT, ord("h")):
-            self.focus = "albums"
-        elif key in (curses.KEY_RIGHT, ord("l")):
-            if self._current_album():
-                self.focus = "tracks"
+        for i, v in enumerate(expanded):
+            col = i + 1
+            row = mid - int(v * (vis_h // 2))
+            row = max(0, min(h - 2, row))
+            try:
+                win.addch(row, col, wave_char, cp(PAIR_ACCENT) | curses.A_BOLD)
+            except curses.error:
+                pass
 
-        elif key in (curses.KEY_UP, ord("k")):
-            if self.focus == "albums":
-                self.album_cursor = max(0, self.album_cursor - 1)
-                self.track_cursor = 0
-            else:
-                self.track_cursor = max(0, self.track_cursor - 1)
+    def _draw_spectrum(self, win, bands, vis_h, w, mirror, ):
+        """Filled area chart."""
+        h, _ = win.getmaxyx()
+        top_row = max(0, h - vis_h - 1)
+        cols = list(range(1, w - 1))
+        n = len(bands)
+        expanded = [bands[int(i * n / len(cols))] for i in range(len(cols))]
+        if mirror:
+            half = len(cols) // 2
+            left  = list(reversed(expanded[:half]))
+            right = expanded[:half]
+            expanded = left + right
 
-        elif key in (curses.KEY_DOWN, ord("j")):
-            if self.focus == "albums":
-                self.album_cursor = min(len(albums) - 1, self.album_cursor + 1)
-                self.track_cursor = 0
-            else:
-                album = self._current_album()
-                if album:
-                    self.track_cursor = min(len(album.paths) - 1, self.track_cursor + 1)
+        for i, v in enumerate(expanded):
+            col = i + 1
+            fill_h = int(v * vis_h)
+            for row_off in range(vis_h):
+                row = top_row + row_off
+                if row >= h - 1:
+                    break
+                bar_row = vis_h - 1 - row_off
+                if bar_row < fill_h:
+                    attr = cp(PAIR_BAR_FILLED) if bar_row > 1 else (cp(PAIR_ACCENT2) | curses.A_BOLD)
+                    try:
+                        win.addch(row, col, "▓", attr)
+                    except curses.error:
+                        pass
 
-        elif key in (curses.KEY_ENTER, 10, 13):
-            if self.focus == "tracks":
-                album = self._current_album()
-                if album:
-                    tracks = album.tracks()
-                    if tracks and self.track_cursor < len(tracks):
-                        if self.on_play_album:
-                            self.on_play_album(album, self.track_cursor)
-                        return "play"
-            elif self.focus == "albums":
-                album = self._current_album()
-                if album and self.on_play_album:
-                    self.on_play_album(album, 0)
-                    return "play"
+    def _draw_dots(self, win, bands, vis_h, w, mirror):
+        h, _ = win.getmaxyx()
+        top_row = max(0, h - vis_h - 1)
+        cols = list(range(1, w - 1))
+        n = len(bands)
+        expanded = [bands[int(i * n / len(cols))] for i in range(len(cols))]
+        if mirror:
+            half = len(cols) // 2
+            left  = list(reversed(expanded[:half]))
+            right = expanded[:half]
+            expanded = left + right
 
-        return None
-
-    def refresh(self):
-        pass  # library is live-updated
+        for i, v in enumerate(expanded):
+            col = i + 1
+            row = top_row + vis_h - 1 - int(v * (vis_h - 1))
+            row = max(top_row, min(top_row + vis_h - 1, row))
+            try:
+                win.addch(row, col, "◆", cp(PAIR_ACCENT) | curses.A_BOLD)
+            except curses.error:
+                pass
