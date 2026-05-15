@@ -2,9 +2,12 @@
 Audio playback engine using pygame.mixer with raw sample exposure for FFT.
 """
 
+from __future__ import annotations
+
 import threading
 import time
 from pathlib import Path
+
 import numpy as np
 
 try:
@@ -67,20 +70,26 @@ class Track:
 
 class Player:
     def __init__(self):
-        self._lock              = threading.Lock()
-        self._track: Track | None = None
-        self._queue: list[Track]  = []
-        self._queue_index: int    = -1
-        self._playing             = False
-        self._paused              = False
-        self._volume              = 0.8
-        self._start_time          = 0.0
-        self._elapsed_at_pause    = 0.0
-        self._on_track_end        = None
+        self._lock                    = threading.Lock()
+        self._track: Track | None     = None
+        self._queue: list[Track]      = []
+        self._queue_index: int        = -1
+        self._playing                 = False
+        self._paused                  = False
+        self._volume                  = 0.8
+        self._start_time              = 0.0
+        self._elapsed_at_pause        = 0.0
+        self._on_track_end            = None
 
         # Raw mono float32 samples for the FFT visualizer.
-        # None = no track loaded; empty array = load failed gracefully.
+        # None  = no track / not yet loaded
+        # empty = load failed (visualizer shows nothing)
         self.raw_samples: np.ndarray | None = None
+
+        # Generation counter: incremented on every play() call.
+        # Background load thread checks its own generation against current;
+        # if they differ, another track started — discard the result.
+        self._load_gen: int = 0
 
         self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
         self._monitor_thread.start()
@@ -123,38 +132,46 @@ class Player:
                 self._playing = False
                 return
 
-        # Load samples for FFT in a background thread so playback starts instantly
-        threading.Thread(target=self._load_samples, args=(self._track.path,), daemon=True).start()
+            # Bump generation so any in-flight load thread for the previous
+            # track knows to discard its result
+            self._load_gen += 1
+            my_gen = self._load_gen
+            path   = self._track.path
 
-    def _load_samples(self, path: str):
+        # Clear samples immediately so the visualizer shows nothing
+        # until the new track's samples arrive
+        self.raw_samples = None
+        threading.Thread(
+            target=self._load_samples,
+            args=(path, my_gen),
+            daemon=True,
+        ).start()
+
+    def _load_samples(self, path: str, gen: int):
         """
-        Load raw PCM samples from the file into self.raw_samples.
-        Uses pygame.sndarray which decodes at mixer's sample rate/format.
-        Falls back to None (visualizer will run in simulation mode) if
-        the file is too large or sndarray fails.
+        Decode the audio file to raw PCM samples in a background thread.
+        Discards the result if a newer track has started playing (gen check).
         """
         try:
             sound   = pygame.mixer.Sound(path)
             samples = pygame.sndarray.array(sound)
 
-            # Mix stereo → mono
-            if samples.ndim > 1:
-                mono = samples.mean(axis=1)
-            else:
-                mono = samples.copy()
+            # Stereo → mono
+            mono = samples.mean(axis=1).astype(np.float32) \
+                   if samples.ndim > 1 \
+                   else samples.astype(np.float32)
 
-            # Normalize to float32 in [-1.0, 1.0]
-            if mono.dtype.kind == 'i' or mono.dtype.kind == 'u':
-                max_val = float(np.iinfo(mono.dtype).max)
-                mono    = mono.astype(np.float32) / max_val
-            else:
-                mono = mono.astype(np.float32)
-
-            self.raw_samples = mono
+            # Normalize integer types to [-1.0, 1.0]
+            if np.issubdtype(samples.dtype, np.integer):
+                mono /= float(np.iinfo(samples.dtype).max)
 
         except Exception:
-            # Graceful degradation: visualizer will fall back to simulation
-            self.raw_samples = np.array([], dtype=np.float32)
+            mono = np.array([], dtype=np.float32)
+
+        # Only store if we're still on the same track
+        with self._lock:
+            if self._load_gen == gen:
+                self.raw_samples = mono
 
     def pause(self):
         if not PYGAME_OK or not self._playing:
@@ -177,6 +194,7 @@ class Player:
             self._playing          = False
             self._paused           = False
             self._elapsed_at_pause = 0.0
+            self._load_gen        += 1   # cancel any pending load
         self.raw_samples = None
 
     def next_track(self) -> bool:
@@ -249,6 +267,7 @@ class Player:
     # ── Monitor thread ────────────────────────────────────────────
 
     def _monitor(self):
+        """Detect natural track end and fire the callback."""
         while True:
             time.sleep(0.25)
             if not PYGAME_OK:
