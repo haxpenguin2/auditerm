@@ -217,3 +217,4 @@ class FileBrowser:
         if self.entries and 0 <= self.cursor < len(self.entries):
             return self.entries[self.cursor]
         return None
+
