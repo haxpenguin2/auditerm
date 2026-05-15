@@ -1,7 +1,7 @@
 import curses
 import math
 import random
-from auditerm.ui.colors import cp, PAIR_BAR_FILLED, PAIR_ACCENT, PAIR_ACCENT2, PAIR_MUTED
+from auditerm.ui.colors import cp, PAIR_BAR_FILLED, PAIR_ACCENT2
 from auditerm.config import Config
 from auditerm.player import Player
 
@@ -9,29 +9,28 @@ class Visualizer:
     def __init__(self, player: Player, cfg: Config):
         self.player = player
         self.cfg = cfg
+        self._bands: list[float] = []
         self._peaks: list[float] = []
-        # Smooth block characters for CAVA-style rendering
+        # Unicode characters for sub-cell vertical resolution (CAVA style)
         self.smooth_blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
     def _generate_bands(self, n: int) -> list[float]:
         p = self.player
-        if not (p.is_playing):
-            return [max(0, b - 0.1) for b in self._bands] # Fade out
+        # Fade out if nothing is playing
+        if not p.is_playing:
+            return [max(0.0, b - 0.08) for b in (self._bands or [0.0] * n)]
 
-    # We use a mix of the current timestamp and random seeds
-    # to create "peaks" that feel intentional.
         t = p.elapsed * 10
         bands = []
         for i in range(n):
-        # Create a "pseudo-frequency" by combining waves
-        # This makes different bands react at different speeds
-            sig = math.sin(t * (i * 0.1 + 1)) * math.cos(t * 0.5)
-            sig = abs(sig) # Only positive bars
+            # Complex wave combination for organic movement
+            sig = math.sin(t * (i * 0.05 + 1)) * math.cos(t * 0.3 + i * 0.1)
+            sig = abs(sig)
 
-        # Add a "kick" every second to simulate a beat
-            beat = 0.4 if (int(p.elapsed * 2) % 2 == 0) else 0.0
+            # Simple kick simulation
+            kick = 0.3 if (int(p.elapsed * 4) % 4 == 0 and i < n//4) else 0.0
 
-            val = (sig * 0.6) + beat + (random.random() * 0.1)
+            val = (sig * 0.7) + kick + (random.random() * 0.05)
             bands.append(min(1.0, val))
 
         self._bands = bands
@@ -39,66 +38,68 @@ class Visualizer:
 
     def draw(self, win):
         win.erase()
-        h, w = win.getmaxyx()
-        if h < 2 or w < 10:
+        h_win, w_win = win.getmaxyx()
+
+        # Guard for small windows
+        if h_win < 2 or w_win < 4:
             return
 
-        # 1. Split window into 3 sections: [Smooth Bars] [Mirrored Peak] [Dot Spectrum]
-        sec_w = w // 3
-        bands = self._generate_bands(sec_w)
+        # CAVA uses the full width (minus potential padding)
+        n_bands = w_win - 2
+        bands = self._generate_bands(n_bands)
 
-        # Sync peaks
-        if len(self._peaks) != len(bands):
+        # Initialize/Update peaks
+        if len(self._peaks) != n_bands:
             self._peaks = list(bands)
+
         for i, v in enumerate(bands):
-            self._peaks[i] = max(v, self._peaks[i] - 0.05)
+            if v > self._peaks[i]:
+                self._peaks[i] = v
+            else:
+                self._peaks[i] = max(0.0, self._peaks[i] - 0.02) # Slow peak drop
 
-        # 2. Draw Sections
-        self._draw_section(win, bands, 0, sec_w, h, mode="smooth")
-        self._draw_section(win, bands, sec_w, sec_w, h, mode="mirror")
-        self._draw_section(win, bands, sec_w * 2, w - (sec_w * 2), h, mode="dots")
+        # Draw the single massive CAVA wall
+        self._draw_cava_style(win, bands, h_win, w_win)
 
-    def _draw_section(self, win, bands, start_x, width, max_h, mode):
-        """Draws a specific visualizer style in a horizontal slice of the window."""
-        h = max_h - 1 # Leave room for window borders if necessary
+    def _draw_cava_style(self, win, bands, max_h, max_w):
+        # We draw from the bottom (h-1) up to the top (0)
+        h = max_h - 1
 
-        for i in range(width):
-            x = start_x + i
-            if i >= len(bands): break
+        for i, val in enumerate(bands):
+            x = i + 1 # Horizontal padding of 1
+            if x >= max_w - 1:
+                break
 
-            val = bands[i]
-            pk = self._peaks[i]
-
-            # Calculate high-res height
-            # Each 'cell' is 8 units high thanks to Unicode blocks
+            # 1. Calculate how many full terminal cells to fill
             total_units = val * h
             full_cells = int(total_units)
-            partial_unit = int((total_units - full_cells) * 8)
 
-            if mode == "smooth":
-                # Draw full blocks
-                for y in range(full_cells):
-                    win.addch(h - y, x, "█", cp(PAIR_BAR_FILLED))
-                # Draw smooth tip
-                if h - full_cells > 0:
-                    win.addch(h - full_cells, x, self.smooth_blocks[partial_unit], cp(PAIR_BAR_FILLED))
+            # 2. Calculate which partial block to use for the very top
+            # (8 steps of resolution per cell)
+            partial_idx = int((total_units - full_cells) * 8)
 
-            elif mode == "mirror":
-                # Mirrored grows from the middle of the section height
-                mid_y = h // 2
-                offset = int(val * (h // 2))
-                for y in range(mid_y - offset, mid_y + offset):
-                    if 0 < y < max_h:
-                        win.addch(y, x, "┃", cp(PAIR_ACCENT))
+            # 3. Draw the solid pillars
+            for y_off in range(full_cells):
+                try:
+                    # Drawing from bottom up
+                    win.addch(h - y_off, x, "█", cp(PAIR_BAR_FILLED))
+                except curses.error:
+                    pass
 
-            elif mode == "dots":
-                # Peak dots only
-                pk_y = h - int(pk * (h - 1))
-                if 0 < pk_y < max_h:
-                    win.addch(pk_y, x, "◆", cp(PAIR_ACCENT2))
+            # 4. Draw the smooth cap
+            if h - full_cells >= 0:
+                try:
+                    char = self.smooth_blocks[partial_idx]
+                    win.addch(h - full_cells, x, char, cp(PAIR_BAR_FILLED))
+                except curses.error:
+                    pass
 
-### Key Fixes Made:
-#* **Vertical Inversion**: Curses `(0,0)` is top-left. To make bars grow **up**, I used `h - y`.
-#* **Smooth Blocks**: Instead of just using `bar_char`, I calculate the remainder of the height and pick the corresponding Unicode block from `self.smooth_blocks`. This makes the movement look fluid rather than stepping #cell-by-cell.
-#* **The "Highlight" Fix**: Notice I am using `win.addch(y, x, char, attr)`. By passing the attribute (color pair) directly into the `addch` call, it prevents the terminal from falling back to a white-background default.
-#* **Modular Sections**: The `draw` function now acts as a coordinator, allowing you to mix and match styles (Smooth, Mirror, Dots) in the same view.
+            # 5. Draw the floating peak (Optional but classic CAVA)
+            pk_val = self._peaks[i]
+            pk_y = h - int(pk_val * h)
+            if pk_y >= 0:
+                try:
+                    # Using a secondary accent color for the peaks
+                    win.addch(pk_y, x, "-", cp(PAIR_ACCENT2))
+                except curses.error:
+                    pass
