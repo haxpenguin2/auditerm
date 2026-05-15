@@ -9,97 +9,92 @@ class Visualizer:
     def __init__(self, player: Player, cfg: Config):
         self.player = player
         self.cfg = cfg
-        self._bands: list[float] = []
-        self._peaks: list[float] = []
-        # Unicode characters for sub-cell vertical resolution (CAVA style)
+        self._target_bands = []  # Where the audio wants to be
+        self._current_bands = [] # Where the bars actually are (smoothed)
+        self._prev_bands = []    # History for integral smoothing
+        self._peaks = []         # Falling peak logic
+
         self.smooth_blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
-    def _generate_bands(self, n: int) -> list[float]:
-        p = self.player
-        # Fade out if nothing is playing
-        if not p.is_playing:
-            return [max(0.0, b - 0.08) for b in (self._bands or [0.0] * n)]
+        # CAVA Physics Constants
+        self.gravity = 0.04      # How fast bars fall
+        self.integral = 0.85     # Smoothing factor (0.0 to 1.0)
+        self.monstercat = 0.7    # Neighbor influence (0.0 to 1.0)
 
-        t = p.elapsed * 10
-        bands = []
+    def _apply_physics(self, raw_bands):
+        n = len(raw_bands)
+        if not self._current_bands or len(self._current_bands) != n:
+            self._current_bands = [0.0] * n
+            self._prev_bands = [0.0] * n
+            self._peaks = [0.0] * n
+
+        # 1. Neighbor Smoothing (Monstercat style)
+        # Higher frequencies are influenced by their lower neighbors
+        for i in range(1, n):
+            raw_bands[i] = max(raw_bands[i], raw_bands[i-1] * self.monstercat)
+        for i in range(n-2, -1, -1):
+            raw_bands[i] = max(raw_bands[i], raw_bands[i+1] * self.monstercat)
+
+        # 2. Integral Smoothing & Gravity
         for i in range(n):
-            # Complex wave combination for organic movement
-            sig = math.sin(t * (i * 0.05 + 1)) * math.cos(t * 0.3 + i * 0.1)
-            sig = abs(sig)
+            # Target is the raw "audio" value
+            target = raw_bands[i]
 
-            # Simple kick simulation
-            kick = 0.3 if (int(p.elapsed * 4) % 4 == 0 and i < n//4) else 0.0
+            # If the audio is higher than the bar, "ooze" up
+            if target > self._current_bands[i]:
+                self._current_bands[i] = target * (1 - self.integral) + self._current_bands[i] * self.integral
+            else:
+                # If audio is lower, let gravity pull the bar down
+                self._current_bands[i] = max(0, self._current_bands[i] - self.gravity)
 
-            val = (sig * 0.7) + kick + (random.random() * 0.05)
-            bands.append(min(1.0, val))
+            # 3. Peak logic (falling slower than bars)
+            if self._current_bands[i] > self._peaks[i]:
+                self._peaks[i] = self._current_bands[i]
+            else:
+                self._peaks[i] = max(0, self._peaks[i] - (self.gravity * 0.5))
 
-        self._bands = bands
-        return bands
+        return self._current_bands
 
     def draw(self, win):
         win.erase()
         h_win, w_win = win.getmaxyx()
+        if h_win < 2 or w_win < 4: return
 
-        # Guard for small windows
-        if h_win < 2 or w_win < 4:
-            return
-
-        # CAVA uses the full width (minus potential padding)
+        # CAVA Setup
         n_bands = w_win - 2
-        bands = self._generate_bands(n_bands)
 
-        # Initialize/Update peaks
-        if len(self._peaks) != n_bands:
-            self._peaks = list(bands)
+        # Simulated raw input (replace this with FFT data if you switch backends)
+        t = self.player.elapsed * 12
+        raw = []
+        for i in range(n_bands):
+            # Base logic: lower bands are busier, higher bands have spikes
+            freq_mod = (i / n_bands)
+            sig = abs(math.sin(t * (0.2 + freq_mod)) * math.cos(t * 0.5))
+            raw.append(sig * math.exp(-freq_mod * 2))
 
-        for i, v in enumerate(bands):
-            if v > self._peaks[i]:
-                self._peaks[i] = v
-            else:
-                self._peaks[i] = max(0.0, self._peaks[i] - 0.02) # Slow peak drop
+        # Apply the CAVA physics engine
+        bands = self._apply_physics(raw)
 
-        # Draw the single massive CAVA wall
-        self._draw_cava_style(win, bands, h_win, w_win)
-
-    def _draw_cava_style(self, win, bands, max_h, max_w):
-        # We draw from the bottom (h-1) up to the top (0)
-        h = max_h - 1
-
+        # Rendering
+        h = h_win - 1
         for i, val in enumerate(bands):
-            x = i + 1 # Horizontal padding of 1
-            if x >= max_w - 1:
-                break
-
-            # 1. Calculate how many full terminal cells to fill
+            x = i + 1
             total_units = val * h
             full_cells = int(total_units)
-
-            # 2. Calculate which partial block to use for the very top
-            # (8 steps of resolution per cell)
             partial_idx = int((total_units - full_cells) * 8)
 
-            # 3. Draw the solid pillars
+            # Draw Pillar
             for y_off in range(full_cells):
-                try:
-                    # Drawing from bottom up
-                    win.addch(h - y_off, x, "█", cp(PAIR_BAR_FILLED))
-                except curses.error:
-                    pass
+                try: win.addch(h - y_off, x, "█", cp(PAIR_BAR_FILLED))
+                except curses.error: pass
 
-            # 4. Draw the smooth cap
+            # Draw Smooth Cap
             if h - full_cells >= 0:
-                try:
-                    char = self.smooth_blocks[partial_idx]
-                    win.addch(h - full_cells, x, char, cp(PAIR_BAR_FILLED))
-                except curses.error:
-                    pass
+                try: win.addch(h - full_cells, x, self.smooth_blocks[partial_idx], cp(PAIR_BAR_FILLED))
+                except curses.error: pass
 
-            # 5. Draw the floating peak (Optional but classic CAVA)
-            pk_val = self._peaks[i]
-            pk_y = h - int(pk_val * h)
+            # Draw Peak
+            pk_y = h - int(self._peaks[i] * h)
             if pk_y >= 0:
-                try:
-                    # Using a secondary accent color for the peaks
-                    win.addch(pk_y, x, "-", cp(PAIR_ACCENT2))
-                except curses.error:
-                    pass
+                try: win.addch(pk_y, x, "-", cp(PAIR_ACCENT2))
+                except curses.error: pass
