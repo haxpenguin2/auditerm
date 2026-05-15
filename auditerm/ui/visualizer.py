@@ -1,31 +1,21 @@
 """
-auditerm visualizer — CAVA-style FFT visualizer.
+auditerm visualizer
 
-Styles: bars | mirror | wave | spectrum | dots | off
+Draws a bar visualizer driven by real FFT data from the player's raw_samples.
+Stops cleanly when audio stops. Simple, reliable, good-looking.
 
-Physics mirrors CAVA:
-  - Hanning-windowed FFT
-  - Logarithmic frequency bins (geomspace, 20Hz–10kHz range)
-  - Monstercat lateral smoothing
-  - Per-band gravity fall + peak dot with slow decay
-  - Time-domain integral smoothing on rise
-
-All tunables are read from config [visualizer] section.
+Styles (set in config): bars | mirror | wave | dots | off
 """
 
 import curses
 import numpy as np
 
-from auditerm.ui.colors import (
-    cp,
-    PAIR_BAR_FILLED, PAIR_BAR_EMPTY,
-    PAIR_ACCENT, PAIR_ACCENT2, PAIR_MUTED,
-)
+from auditerm.ui.colors import cp, PAIR_BAR_FILLED, PAIR_ACCENT2, PAIR_MUTED, PAIR_ACCENT
 from auditerm.config import Config
 from auditerm.player import Player
 
-# Sub-character vertical resolution (braille-style eighth blocks)
-EIGHTH_BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+# Eighth-block characters for smooth sub-character bar tops
+BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
 
 class Visualizer:
@@ -33,276 +23,207 @@ class Visualizer:
         self.player = player
         self.cfg    = cfg
 
-        # Physics params — read from config, fall back to CAVA defaults
-        self.gravity     = float(cfg.get("visualizer", "gravity",     "0.04"))
-        self.monstercat  = float(cfg.get("visualizer", "monstercat",  "1.6"))
-        self.integral    = float(cfg.get("visualizer", "integral",    "0.82"))
-        self.gain        = float(cfg.get("visualizer", "gain",        "12.0"))
-        self.sample_rate = 44100
-        self.buffer_size = 2048
+        self.gravity    = float(cfg.get("visualizer", "gravity",    "0.035"))
+        self.smoothing  = float(cfg.get("visualizer", "smoothing",  "0.75"))
+        self.monstercat = float(cfg.get("visualizer", "monstercat", "1.8"))
+        self.gain       = float(cfg.get("visualizer", "gain",       "14.0"))
 
-        # State
-        self._bands:  np.ndarray = np.array([])
-        self._peaks:  np.ndarray = np.array([])
-        self._prev_raw: np.ndarray = np.array([])
+        self._bars:  np.ndarray = np.zeros(1)
+        self._peaks: np.ndarray = np.zeros(1)
 
-    # ── FFT ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # FFT
+    # ─────────────────────────────────────────────────────────────
 
-    def _get_fft_bands(self, n_bands: int) -> np.ndarray:
+    def _compute_bands(self, n: int) -> np.ndarray:
         """
-        1. Slice a buffer_size chunk from raw_samples at current playback pos.
-        2. Apply Hanning window → FFT.
-        3. Map FFT bins onto n_bands logarithmic frequency buckets.
-        4. Normalize and apply gain.
+        Returns n float values in [0.0, 1.0].
+        Returns zeros immediately if nothing is playing.
         """
+        # Stop condition: return flat zero if not playing
+        if not (self.player.is_playing or self.player.is_paused):
+            return np.zeros(n)
+
         samples = self.player.raw_samples
+        if samples is None or len(samples) == 0:
+            return np.zeros(n)
 
-        if not (self.player.is_playing or self.player.is_paused) \
-                or samples is None or len(samples) == 0:
-            return np.zeros(n_bands)
+        # Slice a 2048-sample window at current playback position
+        sr      = 44100
+        win_sz  = 2048
+        pos     = int(self.player.elapsed * sr)
+        chunk   = samples[pos : pos + win_sz]
 
-        start = int(self.player.elapsed * self.sample_rate)
-        end   = start + self.buffer_size
-        chunk = samples[start:end]
+        if len(chunk) < win_sz:
+            return np.zeros(n)
 
-        if len(chunk) < self.buffer_size:
-            # end of track — zero pad
-            chunk = np.pad(chunk, (0, self.buffer_size - len(chunk)))
+        # Hanning window + FFT magnitude
+        window  = np.hanning(win_sz).astype(np.float32)
+        mag     = np.abs(np.fft.rfft(chunk * window))
 
-        # Normalize int16 → float [-1, 1]
-        if chunk.dtype != np.float32 and chunk.dtype != np.float64:
-            chunk = chunk.astype(np.float32) / 32768.0
+        # Map FFT bins → n log-spaced frequency bands (20 Hz – 10 kHz)
+        n_fft   = len(mag)
+        lo      = max(1,        int(20    / (sr / 2) * n_fft))
+        hi      = min(n_fft-1,  int(10000 / (sr / 2) * n_fft))
+        edges   = np.geomspace(lo, hi, n + 1).astype(int)
 
-        window  = np.hanning(len(chunk))
-        fft_mag = np.abs(np.fft.rfft(chunk * window))
-        n_fft   = len(fft_mag)
-
-        # Logarithmic bin edges: map to 20 Hz – 10 kHz
-        low_bin  = max(1, int(20   / (self.sample_rate / 2) * n_fft))
-        high_bin = min(n_fft - 1, int(10000 / (self.sample_rate / 2) * n_fft))
-        edges    = np.geomspace(low_bin, high_bin, n_bands + 1).astype(int)
-        edges    = np.clip(edges, 0, n_fft - 1)
-
-        bands = np.zeros(n_bands)
-        for i in range(n_bands):
-            lo, hi = edges[i], edges[i + 1]
-            if hi <= lo:
-                hi = lo + 1
-            bands[i] = np.mean(fft_mag[lo:hi])
-
-        # Normalize: divide by RMS of the whole FFT, then apply gain
-        rms = np.sqrt(np.mean(fft_mag ** 2)) + 1e-9
-        bands = (bands / rms) * (self.gain / 100.0)
-        bands = np.clip(bands, 0.0, 1.0)
-
-        return bands
-
-    # ── Physics ──────────────────────────────────────────────────
-
-    def _apply_physics(self, raw: np.ndarray) -> np.ndarray:
-        n = len(raw)
-
-        if len(self._bands) != n:
-            self._bands    = np.zeros(n)
-            self._peaks    = np.zeros(n)
-            self._prev_raw = np.zeros(n)
-
-        # ── Monstercat lateral smoothing ──────────────────────────
-        # Forward pass: each bar pulls up from the left
-        smoothed = raw.copy()
-        for i in range(1, n):
-            smoothed[i] = max(smoothed[i], smoothed[i - 1] / self.monstercat)
-        # Backward pass: and from the right
-        for i in range(n - 2, -1, -1):
-            smoothed[i] = max(smoothed[i], smoothed[i + 1] / self.monstercat)
-
-        # ── Per-band rise/fall physics ─────────────────────────────
+        bands = np.zeros(n, dtype=np.float32)
         for i in range(n):
-            target = smoothed[i]
-            if target > self._bands[i]:
-                # Rise: exponential smoothing toward target
-                self._bands[i] += (target - self._bands[i]) * (1.0 - self.integral)
+            a, b = edges[i], max(edges[i]+1, edges[i+1])
+            bands[i] = np.mean(mag[a:b])
+
+        # Normalize by spectrum RMS so quiet tracks still show bars
+        rms = float(np.sqrt(np.mean(mag**2))) + 1e-9
+        bands = (bands / rms) * (self.gain / 100.0)
+
+        return np.clip(bands, 0.0, 1.0)
+
+    # ─────────────────────────────────────────────────────────────
+    # Physics
+    # ─────────────────────────────────────────────────────────────
+
+    def _physics(self, raw: np.ndarray) -> np.ndarray:
+        n = len(raw)
+        if len(self._bars) != n:
+            self._bars  = np.zeros(n)
+            self._peaks = np.zeros(n)
+
+        # If audio stopped, drain bars to zero with gravity only
+        if not (self.player.is_playing or self.player.is_paused):
+            self._bars  = np.maximum(0.0, self._bars  - self.gravity * 3)
+            self._peaks = np.maximum(0.0, self._peaks - self.gravity * 1.5)
+            return self._bars.copy()
+
+        # Monstercat: each bar pulls up neighbours so bands flow smoothly
+        s = raw.copy()
+        for i in range(1, n):
+            s[i] = max(s[i], s[i-1] / self.monstercat)
+        for i in range(n-2, -1, -1):
+            s[i] = max(s[i], s[i+1] / self.monstercat)
+
+        for i in range(n):
+            if s[i] > self._bars[i]:
+                # Rise: smooth lerp toward target
+                self._bars[i] += (s[i] - self._bars[i]) * (1.0 - self.smoothing)
             else:
-                # Fall: constant gravity
-                self._bands[i] -= self.gravity
-            self._bands[i] = max(0.0, min(1.0, self._bands[i]))
+                # Fall: gravity
+                self._bars[i] = max(0.0, self._bars[i] - self.gravity)
 
-            # Peak: rises instantly, falls at half gravity
-            if self._bands[i] > self._peaks[i]:
-                self._peaks[i] = self._bands[i]
+            # Peak dot: instant rise, slow fall
+            if self._bars[i] >= self._peaks[i]:
+                self._peaks[i] = self._bars[i]
             else:
-                self._peaks[i] -= self.gravity * 0.5
-            self._peaks[i] = max(0.0, min(1.0, self._peaks[i]))
+                self._peaks[i] = max(0.0, self._peaks[i] - self.gravity * 0.4)
 
-        self._prev_raw = smoothed
-        return self._bands.copy()
+        return self._bars.copy()
 
-    # ── Draw dispatch ─────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Draw
+    # ─────────────────────────────────────────────────────────────
 
     def draw(self, win):
         win.erase()
-        h_win, w_win = win.getmaxyx()
-        if h_win < 2 or w_win < 4:
+        h, w = win.getmaxyx()
+        if h < 2 or w < 4:
             return
 
-        style  = self.cfg.get("visualizer", "style", "bars")
-        mirror = self.cfg.getbool("visualizer", "mirror", True)
-
+        style = self.cfg.get("visualizer", "style", "bars")
         if style == "off":
             return
 
-        # Content area (leave 1-char border on left/right)
-        content_w = w_win - 2
-        h         = h_win          # use full height for the vis window
-
+        # Number of bands = drawable columns
         if style == "mirror":
-            n_bands = content_w // 2
+            n = (w - 2) // 2
         else:
-            n_bands = content_w
+            n = w - 2
 
-        raw   = self._get_fft_bands(n_bands)
-        bands = self._apply_physics(raw)
+        raw   = self._compute_bands(n)
+        bands = self._physics(raw)
 
         if style in ("bars", "mirror"):
-            self._draw_bars(win, bands, h, w_win, style == "mirror")
+            self._draw_bars(win, bands, h, w, mirror=(style == "mirror"))
         elif style == "wave":
-            self._draw_wave(win, bands, h, w_win)
-        elif style == "spectrum":
-            self._draw_spectrum(win, bands, h, w_win)
+            self._draw_wave(win, bands, h, w)
         elif style == "dots":
-            self._draw_dots(win, bands, h, w_win)
+            self._draw_dots(win, bands, h, w)
 
-    # ── Bar renderer (bars + mirror) ─────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Styles
+    # ─────────────────────────────────────────────────────────────
 
-    def _draw_bars(self, win, bands: np.ndarray, h: int, w: int, mirror: bool):
-        n = len(bands)
-        peaks = self._peaks[:n]
+    def _draw_bars(self, win, bands, h, w, mirror=False):
+        peaks = self._peaks[:len(bands)]
 
-        def draw_column(col: int, val: float, peak: float):
-            """Draw one bar column with eighth-block smooth top and peak dot."""
-            total_h  = val * (h - 1)          # float height in chars
-            full     = int(total_h)            # solid blocks
-            partial  = int((total_h - full) * 8)  # 0–7 for smooth top
+        def col(x, val, peak):
+            # floating-point height → full blocks + smooth top eighth-block
+            fh      = val * (h - 1)
+            full    = int(fh)
+            partial = int((fh - full) * 8)
 
-            # solid fill from bottom
-            for row_off in range(full):
-                row = h - 1 - row_off
+            # solid fill upward from bottom row
+            for off in range(full):
+                row = h - 1 - off
                 if 0 <= row < h:
-                    try:
-                        win.addch(row, col, "█", cp(PAIR_BAR_FILLED))
-                    except curses.error:
-                        pass
+                    try: win.addch(row, x, "█", cp(PAIR_BAR_FILLED))
+                    except curses.error: pass
 
             # smooth partial block on top
-            top_row = h - 1 - full
-            if 0 <= top_row < h and partial > 0:
-                try:
-                    win.addch(top_row, col, EIGHTH_BLOCKS[partial], cp(PAIR_BAR_FILLED))
-                except curses.error:
-                    pass
+            top = h - 1 - full
+            if 0 <= top < h and partial > 0:
+                try: win.addch(top, x, BLOCKS[partial], cp(PAIR_BAR_FILLED))
+                except curses.error: pass
 
-            # falling peak dot
-            if peak > 0.01:
-                peak_row = h - 1 - int(peak * (h - 1))
-                peak_row = max(0, min(h - 1, peak_row))
-                try:
-                    win.addch(peak_row, col, "─", cp(PAIR_ACCENT2) | curses.A_BOLD)
-                except curses.error:
-                    pass
+            # falling peak dash
+            if peak > 0.015:
+                pr = h - 1 - int(peak * (h - 1))
+                pr = max(0, min(h - 1, pr))
+                try: win.addch(pr, x, "─", cp(PAIR_ACCENT2) | curses.A_BOLD)
+                except curses.error: pass
 
         if mirror:
-            # Left half: bands reversed; right half: bands forward
-            half_w = w // 2
-            for i, (val, peak) in enumerate(zip(bands, peaks)):
-                left_col  = half_w - 1 - i
-                right_col = half_w + i
-                if 1 <= left_col < w - 1:
-                    draw_column(left_col, val, peak)
-                if 1 <= right_col < w - 1:
-                    draw_column(right_col, val, peak)
+            cx = w // 2
+            for i, (v, p) in enumerate(zip(bands, peaks)):
+                lx = cx - 1 - i
+                rx = cx + i
+                if 1 <= lx < w-1: col(lx, v, p)
+                if 1 <= rx < w-1: col(rx, v, p)
         else:
-            for i, (val, peak) in enumerate(zip(bands, peaks)):
-                col = i + 1
-                if col < w - 1:
-                    draw_column(col, val, peak)
+            for i, (v, p) in enumerate(zip(bands, peaks)):
+                x = i + 1
+                if x < w - 1:
+                    col(x, v, p)
 
-    # ── Wave renderer ─────────────────────────────────────────────
-
-    def _draw_wave(self, win, bands: np.ndarray, h: int, w: int):
-        """Oscilloscope-style center wave."""
+    def _draw_wave(self, win, bands, h, w):
         mid  = h // 2
         cols = w - 2
         n    = len(bands)
+        exp  = np.interp(np.linspace(0, n-1, cols), np.arange(n), bands)
 
-        # Expand bands to fill width
-        expanded = np.interp(np.linspace(0, n - 1, cols), np.arange(n), bands)
-
-        prev_row = None
-        for i, val in enumerate(expanded):
-            col = i + 1
-            # val drives amplitude above/below center
-            offset = int(val * (h // 2 - 1))
-            row_hi = max(0, mid - offset)
-            row_lo = min(h - 1, mid + offset)
-
-            # vertical line connecting hi and lo for filled look
-            for row in range(row_hi, row_lo + 1):
-                attr = cp(PAIR_ACCENT) | curses.A_BOLD if row == row_hi or row == row_lo \
+        for i, v in enumerate(exp):
+            x      = i + 1
+            amp    = int(v * (h // 2 - 1))
+            top    = max(0,   mid - amp)
+            bottom = min(h-1, mid + amp)
+            for row in range(top, bottom + 1):
+                ch   = "┼" if row == mid else ("╷" if row < mid else "╵")
+                attr = cp(PAIR_ACCENT) | curses.A_BOLD if row in (top, bottom) \
                        else cp(PAIR_BAR_FILLED)
-                try:
-                    win.addch(row, col, "│" if row != mid else "─", attr)
-                except curses.error:
-                    pass
+                try: win.addch(row, x, ch, attr)
+                except curses.error: pass
 
-    # ── Spectrum (filled area) ────────────────────────────────────
+    def _draw_dots(self, win, bands, h, w):
+        cols  = w - 2
+        n     = len(bands)
+        peaks = self._peaks[:n]
+        exp   = np.interp(np.linspace(0, n-1, cols), np.arange(n), bands)
+        expp  = np.interp(np.linspace(0, n-1, cols), np.arange(n), peaks)
 
-    def _draw_spectrum(self, win, bands: np.ndarray, h: int, w: int):
-        """Filled area under the curve, gradient-style."""
-        cols = w - 2
-        n    = len(bands)
-        expanded = np.interp(np.linspace(0, n - 1, cols), np.arange(n), bands)
-
-        for i, val in enumerate(expanded):
-            col      = i + 1
-            fill_h   = int(val * (h - 1))
-            total_h  = val * (h - 1)
-            partial  = int((total_h - fill_h) * 8)
-
-            for row_off in range(fill_h):
-                row = h - 1 - row_off
-                # Gradient: top rows use accent color
-                attr = cp(PAIR_ACCENT2) if row_off >= fill_h - 2 else cp(PAIR_BAR_FILLED)
-                try:
-                    win.addch(row, col, "█", attr)
-                except curses.error:
-                    pass
-
-            top_row = h - 1 - fill_h
-            if 0 <= top_row < h and partial > 0:
-                try:
-                    win.addch(top_row, col, EIGHTH_BLOCKS[partial], cp(PAIR_ACCENT2))
-                except curses.error:
-                    pass
-
-    # ── Dots ─────────────────────────────────────────────────────
-
-    def _draw_dots(self, win, bands: np.ndarray, h: int, w: int):
-        """Single dot per band at its current height, with peak trail."""
-        cols   = w - 2
-        n      = len(bands)
-        peaks  = self._peaks[:n]
-        expanded       = np.interp(np.linspace(0, n - 1, cols), np.arange(n), bands)
-        expanded_peaks = np.interp(np.linspace(0, n - 1, cols), np.arange(n), peaks)
-
-        for i, (val, pk) in enumerate(zip(expanded, expanded_peaks)):
-            col  = i + 1
-            row  = h - 1 - int(val * (h - 1))
-            prow = h - 1 - int(pk  * (h - 1))
-            row  = max(0, min(h - 1, row))
-            prow = max(0, min(h - 1, prow))
+        for i, (v, p) in enumerate(zip(exp, expp)):
+            x  = i + 1
+            r  = max(0, min(h-1, h - 1 - int(v * (h-1))))
+            pr = max(0, min(h-1, h - 1 - int(p * (h-1))))
             try:
-                if prow != row:
-                    win.addch(prow, col, "·", cp(PAIR_MUTED))
-                win.addch(row, col, "◆", cp(PAIR_ACCENT) | curses.A_BOLD)
-            except curses.error:
-                pass
+                if pr != r and p > 0.015:
+                    win.addch(pr, x, "·", cp(PAIR_MUTED))
+                win.addch(r, x, "◆", cp(PAIR_ACCENT) | curses.A_BOLD)
+            except curses.error: passpass
