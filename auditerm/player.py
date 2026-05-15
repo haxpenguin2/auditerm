@@ -23,6 +23,16 @@ except ImportError:
     MUTAGEN_OK = False
 
 
+def _fmt_time(seconds: float) -> str:
+    """Helper to format seconds into M:SS or H:MM:SS."""
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
 class Track:
     """Metadata for a single audio file."""
     def __init__(self, path: str):
@@ -54,20 +64,15 @@ class Track:
             return f"{self.artist} — {self.title}"
         return self.filename
 
-
-def _fmt_time(seconds: float) -> str:
-    s = int(seconds)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
+    def duration_str(self) -> str:
+        """Returns the track duration as a formatted string."""
+        return _fmt_time(self.duration)
 
 
 class Player:
     """
     Stateful audio player.
-    Exposes self.raw_samples for the visualizer and properties for the UI.
+    Exposes raw_samples for the visualizer and full state for the UI.
     """
 
     def __init__(self):
@@ -82,18 +87,20 @@ class Player:
         self._elapsed_at_pause = 0.0
         self._on_track_end = None
 
-        # Buffer for visualizer
+        # Buffer for the FFT visualizer
         self.raw_samples = np.array([], dtype=np.float32)
 
         self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
         self._monitor_thread.start()
 
-    # ── queue management ──────────────────────────────────────────
+    # ── Queue Management ──────────────────────────────────────────
 
     def set_queue(self, tracks: list[Track], index: int = 0):
         with self._lock:
             self._queue = tracks
             self._queue_index = index
+
+    # ── Playback Controls ─────────────────────────────────────────
 
     def play(self, track: Track | None = None):
         if not PYGAME_OK:
@@ -104,14 +111,15 @@ class Player:
             if self._track is None:
                 return
             try:
-                # Standard playback
+                # Load and play
                 pygame.mixer.music.load(self._track.path)
                 pygame.mixer.music.set_volume(self._volume)
                 pygame.mixer.music.play()
 
-                # Extract raw samples for FFT analysis
+                # Extract raw samples for FFT analysis in visualizer.py
                 sound = pygame.mixer.Sound(self._track.path)
                 samples = pygame.sndarray.array(sound)
+                # Average stereo to mono for visualizer processing
                 if len(samples.shape) > 1:
                     self.raw_samples = samples.mean(axis=1)
                 else:
@@ -169,7 +177,7 @@ class Player:
         if PYGAME_OK:
             pygame.mixer.music.set_volume(self._volume)
 
-    # ── state getters ─────────────────────────────────────────────
+    # ── Getters / Properties for UI (layout.py, controls.py) ───────
 
     @property
     def is_playing(self) -> bool:
@@ -197,18 +205,21 @@ class Player:
 
     @property
     def progress(self) -> float:
-        """0.0 – 1.0"""
+        """Percentage of track played (0.0 to 1.0)."""
         if self._track and self._track.duration > 0:
             return min(1.0, self.elapsed / self._track.duration)
         return 0.0
 
+    def elapsed_str(self) -> str:
+        return _fmt_time(self.elapsed)
+
     def on_track_end(self, cb):
         self._on_track_end = cb
 
-    # ── background monitor ────────────────────────────────────────
+    # ── Background Thread ─────────────────────────────────────────
 
     def _monitor(self):
-        """Monitor for track end and auto-advance."""
+        """Monitors pygame events to auto-advance the queue."""
         while True:
             time.sleep(0.25)
             if not PYGAME_OK:
@@ -218,6 +229,7 @@ class Player:
                 paused = self._paused
             if playing and not paused:
                 if not pygame.mixer.music.get_busy():
+                    # Track ended naturally
                     with self._lock:
                         self._playing = False
                         self._elapsed_at_pause = 0.0
